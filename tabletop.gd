@@ -1,5 +1,6 @@
 extends Node3D
 
+const ExplorationDeck := preload("res://exploration_deck.gd")
 const RoadNetwork := preload("res://road_network.gd")
 const TerrainCatalog := preload("res://terrain_catalog.gd")
 const LANE_NAMES := ["1 North", "2 East", "3 South", "4 West"]
@@ -37,6 +38,7 @@ enum FrontlineOrder { FIRST_PLAYER, LAST_PLAYER }
 @export var frontline_order: FrontlineOrder = FrontlineOrder.FIRST_PLAYER
 
 class Hero:
+	var hand: Array[StringName] = []
 	var id: StringName
 	var attack_damage: int
 	var title: String
@@ -62,6 +64,7 @@ class Enemy:
 	var attack_damage: int
 	var remove_on_breach: bool
 	var blocked_destination := -1
+	var skip_movement := 0
 	var attack_animation: Tween
 	var health: int
 	var max_health: int
@@ -90,6 +93,27 @@ var fork_rolls: Array[String] = []
 var round_number := 1
 var phase := Phase.TITLE
 var active_player := 0
+@export var exploration_seed := 0
+var cards := ExplorationDeck.new()
+var shield_hp := 0
+var extra_grunts := 0
+var pending_card: StringName
+var pending_owner: Hero
+var selected_card := -1
+var card_enemy: Enemy
+var card_space := -1
+var last_card_effect := ""
+var hand_controls: HFlowContainer
+var card_details: Label
+var card_counts: Label
+var card_notice: AcceptDialog
+var card_play: Button
+var card_cancel: Button
+var hand_buttons: Array[Button] = []
+var debug_controls: VBoxContainer
+var debug_card_picker: OptionButton
+var debug_hero_picker: OptionButton
+var card_debug_enabled := OS.is_debug_build() and "--pathward-card-debug" in OS.get_cmdline_user_args()
 var wave := 0
 var wave_plan: Array = []
 var integrity := MAX_INTEGRITY
@@ -166,6 +190,7 @@ func _ready() -> void:
 		lay_tile(cell, ports, lane + 1)
 		add_lane_label(lane, cell)
 	build_controls()
+	cards.reset(exploration_seed)
 	refresh("")
 
 
@@ -381,6 +406,7 @@ func build_controls() -> void:
 	instructions = centered_label(rows)
 
 	build_setup_controls(rows)
+	build_card_controls(rows, overlay)
 
 	tile_card = PanelContainer.new()
 	tile_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -455,7 +481,7 @@ func centered_label(parent: BoxContainer) -> Label:
 	return label
 
 
-func action(parent: HBoxContainer, caption: String, callback: Callable) -> Button:
+func action(parent: Container, caption: String, callback: Callable) -> Button:
 	var button := Button.new()
 	button.text = caption
 	parent.add_child(button)
@@ -464,6 +490,8 @@ func action(parent: HBoxContainer, caption: String, callback: Callable) -> Butto
 
 
 func restart() -> void:
+	if pending_owner != null:
+		return
 	get_tree().reload_current_scene.call_deferred()
 
 
@@ -497,6 +525,8 @@ func select_character(character_index: int) -> void:
 
 
 func advance_phase() -> void:
+	if pending_owner != null:
+		return
 	match phase:
 		Phase.TITLE:
 			phase = Phase.SETUP
@@ -517,6 +547,7 @@ func advance_phase() -> void:
 
 
 func begin_player_turn(index: int, message: String) -> void:
+	clear_card_selection()
 	if phase == Phase.PLAYER:
 		heroes[active_player].budget.end_turn()
 	aiming = false
@@ -540,7 +571,7 @@ func can_reveal() -> bool:
 	if phase != Phase.PLAYER:
 		return false
 	var hero := heroes[active_player]
-	return hero.health > 0 and hero.budget.actions_left > 0 and hero.budget.reveals_left > 0
+	return pending_owner == null and selected_card < 0 and hero.health > 0 and hero.budget.actions_left > 0 and hero.budget.reveals_left > 0
 
 
 func reveal_options() -> Dictionary:
@@ -666,10 +697,10 @@ func place_tile() -> void:
 			var before := hero.budget.energy
 			hero.budget.energy += int(terrain.parameters.amount)
 			message += " Restored %d Energy." % (hero.budget.energy - before)
-	if terrain.card_reward:
-		message += " Exploration card available in Stage 5."
 	drawn_tile = -1
 	placement_target = Vector2i.ZERO
+	if terrain.card_reward:
+		draw_exploration_card(hero)
 	refresh(message)
 
 
@@ -725,7 +756,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		update_camera()
 		get_viewport().set_input_as_handled()
 		return
-	if click.button_index != MOUSE_BUTTON_LEFT or phase != Phase.PLAYER:
+	if click.button_index != MOUSE_BUTTON_LEFT or phase != Phase.PLAYER or pending_owner != null:
+		return
+	if selected_card >= 0:
+		handle_card_target(click.position)
+		get_viewport().set_input_as_handled()
 		return
 
 	if drawn_tile >= 0:
@@ -821,13 +856,13 @@ func find_attack_targets() -> Array[Enemy]:
 
 
 func toggle_attack() -> void:
-	if phase == Phase.PLAYER and drawn_tile < 0 and not attack_targets.is_empty():
+	if phase == Phase.PLAYER and pending_owner == null and selected_card < 0 and drawn_tile < 0 and not attack_targets.is_empty():
 		aiming = not aiming
 		refresh("")
 
 
 func click_attack_target(click: Vector2) -> void:
-	if phase != Phase.PLAYER or not aiming:
+	if phase != Phase.PLAYER or pending_owner != null or selected_card >= 0 or not aiming:
 		return
 	var nearest: Enemy
 	var distance_limit := 21.0
@@ -878,7 +913,7 @@ func monster_attack(hero: Hero, enemy: Enemy) -> String:
 
 
 func move_hero(destination: int) -> void:
-	if phase != Phase.PLAYER or aiming or drawn_tile >= 0 or not legal_moves.has(destination):
+	if phase != Phase.PLAYER or pending_owner != null or selected_card >= 0 or aiming or drawn_tile >= 0 or not legal_moves.has(destination):
 		return
 	var hero := heroes[active_player]
 	var cost: int = legal_moves[destination]
@@ -894,35 +929,50 @@ func roll_wave() -> void:
 	fork_rolls.clear()
 	warden_defended = false
 	var rolls: Array[String] = []
-	var composition: Array = wave_plan[wave]
+	var composition: Array = wave_plan[wave].duplicate()
+	for _extra in range(extra_grunts):
+		composition.append("Grunt")
+	extra_grunts = 0
 	for title: String in composition:
-		var lane := randi_range(0, 3)
-		var entry: Dictionary = ENEMY_TYPES[title]
-		var enemy := Enemy.new()
-		enemy.title = title
-		enemy.stride = entry["stride"]
-		enemy.breach_damage = entry["breach_damage"]
-		enemy.attack_damage = entry.get("attack_damage", 1)
-		enemy.remove_on_breach = entry.get("remove_on_breach", true)
-		enemy.max_health = entry["health"]
-		enemy.health = enemy.max_health
-		enemy.location = network.entry_for_lane(lane)
-		enemy.visited[enemy.location] = true
-		enemy.piece = miniature(title, entry["color"])
-		if enemy.max_health > 1:
-			enemy.health_label = Label3D.new()
-			enemy.health_label.position = Vector3.UP * 1.03
-			enemy.health_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-			enemy.health_label.pixel_size = 0.004
-			enemy.health_label.font_size = 36
-			enemy.health_label.outline_size = 10
-			enemy.health_label.modulate = Color("#ffc692")
-			enemy.piece.add_child(enemy.health_label)
-		enemy.target_marker = block(Vector3.ZERO, Vector3(0.45, 0.045, 0.45), Color.WHITE, enemy.piece)
-		enemy.target_marker.material_override = attack_material
-		enemies.append(enemy)
-		rolls.append("%s → %s" % [title, LANE_NAMES[lane]])
+		var lane := spawn_enemy(title)
+		if lane >= 0:
+			rolls.append("%s → %s" % [title, LANE_NAMES[lane]])
 	dice_result = "Lane d4   " + "  ·  ".join(rolls)
+
+
+func spawn_enemy(title: String) -> int:
+	var valid_lanes: Array[int] = []
+	for lane in range(LANE_NAMES.size()):
+		if network.entry_for_lane(lane) > FORTRESS:
+			valid_lanes.append(lane)
+	if valid_lanes.is_empty():
+		return -1
+	var lane: int = valid_lanes.pick_random()
+	var entry: Dictionary = ENEMY_TYPES[title]
+	var enemy := Enemy.new()
+	enemy.title = title
+	enemy.stride = entry["stride"]
+	enemy.breach_damage = entry["breach_damage"]
+	enemy.attack_damage = entry.get("attack_damage", 1)
+	enemy.remove_on_breach = entry.get("remove_on_breach", true)
+	enemy.max_health = entry["health"]
+	enemy.health = enemy.max_health
+	enemy.location = network.entry_for_lane(lane)
+	enemy.visited[enemy.location] = true
+	enemy.piece = miniature(title, entry["color"])
+	if enemy.max_health > 1:
+		enemy.health_label = Label3D.new()
+		enemy.health_label.position = Vector3.UP * 1.03
+		enemy.health_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		enemy.health_label.pixel_size = 0.004
+		enemy.health_label.font_size = 36
+		enemy.health_label.outline_size = 10
+		enemy.health_label.modulate = Color("#ffc692")
+		enemy.piece.add_child(enemy.health_label)
+	enemy.target_marker = block(Vector3.ZERO, Vector3(0.45, 0.045, 0.45), Color.WHITE, enemy.piece)
+	enemy.target_marker.material_override = attack_material
+	enemies.append(enemy)
+	return lane
 
 
 func layout_enemies() -> void:
@@ -934,7 +984,7 @@ func layout_enemies() -> void:
 		if hero_at(enemy.location) != null:
 			offset.x += 0.34
 		enemy.piece.position = network.positions[enemy.location] + offset
-		enemy.target_marker.visible = aiming and enemy in attack_targets
+		enemy.target_marker.visible = (aiming and enemy in attack_targets) or (selected_card >= 0 and card_can_target_enemy(enemy))
 		if enemy.health_label != null:
 			enemy.health_label.text = "%d/%d" % [enemy.health, enemy.max_health]
 
@@ -981,9 +1031,14 @@ func resolve_enemies() -> void:
 	for enemy in marching:
 		if enemy not in enemies:
 			continue
+		var frozen := enemy.skip_movement > 0
+		enemy.skip_movement = maxi(0, enemy.skip_movement - 1)
 		var defender := hero_at(enemy.location)
 		if defender != null:
 			report.append(monster_attack(defender, enemy))
+			continue
+		if frozen:
+			report.append("%s is held by a Tar Pit." % enemy.title)
 			continue
 		for _step in range(enemy.stride):
 			var routes := network.routes_from(enemy.location, enemy.visited)
@@ -1005,9 +1060,7 @@ func resolve_enemies() -> void:
 					warden_defended = true
 					report.append("Warden blocked a breach.")
 				else:
-					var lost_hp := mini(integrity, enemy.breach_damage)
-					integrity -= lost_hp
-					damage += lost_hp
+					damage += damage_fortress(enemy.breach_damage)
 				if enemy.remove_on_breach:
 					remove_enemy(enemy)
 				else:
@@ -1055,6 +1108,387 @@ func resolve_enemies() -> void:
 		begin_next_round(message)
 
 
+func damage_fortress(amount: int) -> int:
+	var prevented := mini(shield_hp, amount)
+	shield_hp -= prevented
+	var lost := mini(integrity, amount - prevented)
+	integrity -= lost
+	return lost
+
+
+func draw_exploration_card(hero: Hero, forced: StringName = &"") -> void:
+	if pending_owner != null:
+		return
+	var id := forced if forced != &"" else cards.draw_card()
+	var resolved: Array[StringName] = []
+	var feedback: Array[String] = []
+	while id != &"":
+		var definition: Dictionary = ExplorationDeck.DEFINITIONS[id]
+		var result := ""
+		if definition.held:
+			result = receive_held_card(hero, id)
+		else:
+			result = resolve_immediate_card(hero, definition)
+			resolved.append(id)
+		feedback.append(ExplorationDeck.description(id) + "\n" + result)
+		if definition.effect != &"draw":
+			break
+		id = cards.draw_card()
+		if id == &"":
+			feedback.append("No additional cards available.")
+	# Resolved cards stay out of the discard until the entire chain finishes.
+	cards.discard.append_array(resolved)
+	show_card_notice("\n\n".join(feedback) if not feedback.is_empty() else "No exploration cards available.")
+
+
+func receive_held_card(hero: Hero, id: StringName) -> String:
+	if hero.hand.size() < ExplorationDeck.HAND_LIMIT:
+		hero.hand.append(id)
+		return "Added to %s’s hand." % hero.title
+	pending_owner = hero
+	pending_card = id
+	return "%s’s hand is full. Choose one of the four cards to discard." % hero.title
+
+
+func discard_from_full_hand(index: int) -> void:
+	if pending_owner == null or index < 0 or index > ExplorationDeck.HAND_LIMIT:
+		return
+	var discarded := pending_card
+	if index < ExplorationDeck.HAND_LIMIT:
+		discarded = pending_owner.hand[index]
+		pending_owner.hand[index] = pending_card
+	cards.discard.append(discarded)
+	pending_owner = null
+	pending_card = &""
+	last_card_effect = "Discarded %s." % ExplorationDeck.DEFINITIONS[discarded].name
+	refresh(last_card_effect)
+
+
+func resolve_immediate_card(hero: Hero, card: Dictionary) -> String:
+	var amount: int = card.amount
+	match card.effect:
+		&"draw":
+			return "Drawing one more exploration card."
+		&"energy":
+			var before := hero.budget.energy
+			hero.budget.energy += amount
+			return "%s restored %d Energy." % [hero.title, hero.budget.energy - before]
+		&"repair":
+			var restored := mini(MAX_INTEGRITY - integrity, amount)
+			integrity += restored
+			return "Fortress restored %d HP." % restored
+		&"reveal":
+			hero.budget.reveals_left += amount
+			hero.budget.reveal_limit += amount
+			return "Gained one reveal this turn."
+		&"shield":
+			shield_hp += amount
+			return "Fortress protection increased by %d." % amount
+		&"ambush":
+			var lane := spawn_enemy("Grunt")
+			return "A Grunt entered lane %s." % LANE_NAMES[lane] if lane >= 0 else "No valid lane for the ambush."
+		&"damage":
+			var lost := damage_fortress(amount)
+			if integrity == 0:
+				hero.budget.end_turn()
+				phase = Phase.COMPLETE
+				return "Fortress lost %d HP. The base was destroyed." % lost
+			return "Fortress lost %d HP." % lost
+		&"discard":
+			if hero.hand.is_empty():
+				return "%s has no cards to discard." % hero.title
+			var index := cards.rng.randi_range(0, hero.hand.size() - 1)
+			var lost_card: StringName = hero.hand.pop_at(index)
+			cards.discard.append(lost_card)
+			return "Discarded %s." % ExplorationDeck.DEFINITIONS[lost_card].name
+		&"reinforce":
+			if not wave_waiting and wave + 1 >= wave_plan.size():
+				return "No later wave is scheduled."
+			extra_grunts += amount
+			return "Added one Grunt to the next unspawned wave."
+		&"exhaust":
+			hero.budget.next_movement_penalty += amount
+			return "%s will lose %d movement next turn." % [hero.title, amount]
+	return "No effect applied."
+
+
+func build_card_controls(rows: VBoxContainer, overlay: CanvasLayer) -> void:
+	card_counts = centered_label(rows)
+	hand_controls = HFlowContainer.new()
+	hand_controls.alignment = FlowContainer.ALIGNMENT_CENTER
+	rows.add_child(hand_controls)
+	for index in range(ExplorationDeck.HAND_LIMIT + 1):
+		hand_buttons.append(action(hand_controls, "", choose_hand_card.bind(index)))
+	card_play = action(hand_controls, "Play card", play_selected_card)
+	card_cancel = action(hand_controls, "Cancel", cancel_card)
+	card_details = centered_label(rows)
+	card_notice = AcceptDialog.new()
+	card_notice.title = "Exploration card"
+	overlay.add_child(card_notice)
+	if card_debug_enabled:
+		build_card_debug(rows)
+
+
+func show_card_notice(message: String) -> void:
+	last_card_effect = message
+	card_notice.title = "Exploration card"
+	card_notice.dialog_text = message
+	if DisplayServer.get_name() != "headless":
+		card_notice.popup_centered(Vector2i(430, 0))
+
+
+func hand_ready() -> bool:
+	return phase == Phase.PLAYER and pending_owner == null and drawn_tile < 0 and not aiming and heroes[active_player].health > 0
+
+
+func can_select_card(id: StringName) -> bool:
+	if not hand_ready() or heroes[active_player].budget.actions_left <= 0:
+		return false
+	match ExplorationDeck.DEFINITIONS[id].effect:
+		&"freeze":
+			return enemies.any(func(enemy: Enemy) -> bool: return enemy.skip_movement == 0)
+		&"burst":
+			return heroes[active_player].budget.movement_left > 0
+		&"dash":
+			for node in range(1, network.positions.size()):
+				if is_dash_target(node):
+					return true
+	return false
+
+
+func choose_hand_card(index: int) -> void:
+	if pending_owner != null:
+		discard_from_full_hand(index)
+		return
+	if not hand_ready():
+		return
+	var hand := heroes[active_player].hand
+	if index >= hand.size() or not can_select_card(hand[index]):
+		return
+	clear_card_selection()
+	selected_card = index
+	refresh("")
+
+
+func clear_card_selection() -> void:
+	selected_card = -1
+	card_enemy = null
+	card_space = -1
+
+
+func cancel_card() -> void:
+	clear_card_selection()
+	refresh("Card play canceled.")
+
+
+func selected_card_id() -> StringName:
+	if phase != Phase.PLAYER or selected_card < 0 or selected_card >= heroes[active_player].hand.size():
+		return &""
+	return heroes[active_player].hand[selected_card]
+
+
+func card_can_target_enemy(enemy: Enemy) -> bool:
+	return selected_card_id() == &"tar_pit" and enemy != null and enemy in enemies and enemy.skip_movement == 0
+
+
+func is_dash_target(node: int) -> bool:
+	var hero := heroes[active_player]
+	if node <= FORTRESS or node == hero.location or hero_at(node) != null or enemy_at(node) != null:
+		return false
+	var origin := network.tile_at(hero.location)
+	var target := network.tile_at(node)
+	return origin != null and target != null and origin.lane == target.lane
+
+
+func card_can_target_space(node: int) -> bool:
+	return selected_card_id() == &"lane_dash" and is_dash_target(node)
+
+
+func handle_card_target(click: Vector2) -> void:
+	var nearest := 22.0
+	if selected_card_id() == &"tar_pit":
+		var enemy_target: Enemy
+		for enemy in enemies:
+			if not card_can_target_enemy(enemy):
+				continue
+			var body := enemy.piece.position + Vector3.UP * (0.38 * enemy.piece.scale.y)
+			var distance := camera.unproject_position(body).distance_to(click)
+			if distance < nearest:
+				enemy_target = enemy
+				nearest = distance
+		card_enemy = enemy_target
+	elif selected_card_id() == &"lane_dash":
+		card_space = -1
+		for node in range(1, network.positions.size()):
+			if not card_can_target_space(node):
+				continue
+			var distance := camera.unproject_position(network.positions[node]).distance_to(click)
+			if distance < nearest:
+				card_space = node
+				nearest = distance
+	refresh("")
+
+
+func card_target_instruction() -> String:
+	match selected_card_id():
+		&"tar_pit":
+			return "Click an orange-marked monster." if card_enemy == null else "Target: %s. Confirm to play Tar Pit." % card_enemy.title
+		&"lane_dash":
+			return "Choose an empty highlighted space in your lane." if card_space < 0 else "Destination selected. Confirm to dash."
+	return "Confirm to double your remaining movement."
+
+
+func card_play_ready(id: StringName) -> bool:
+	if id == &"" or not can_select_card(id):
+		return false
+	match id:
+		&"tar_pit":
+			return card_can_target_enemy(card_enemy)
+		&"lane_dash":
+			return card_can_target_space(card_space)
+	return true
+
+
+func play_selected_card() -> void:
+	var id := selected_card_id()
+	if not card_play_ready(id):
+		return
+	var hero := heroes[active_player]
+	if not hero.budget.spend_action():
+		return
+	var card: Dictionary = ExplorationDeck.DEFINITIONS[id]
+	match card.effect:
+		&"freeze":
+			card_enemy.skip_movement = card.amount
+		&"burst":
+			var bonus := hero.budget.movement_left * (int(card.amount) - 1)
+			hero.budget.movement_limit += bonus
+			hero.budget.movement_left += bonus
+		&"dash":
+			hero.location = card_space
+	hero.hand.remove_at(selected_card)
+	cards.discard.append(id)
+	clear_card_selection()
+	last_card_effect = "%s played %s." % [hero.title, card.name]
+	refresh(last_card_effect)
+
+
+func build_card_debug(rows: VBoxContainer) -> void:
+	debug_controls = VBoxContainer.new()
+	rows.add_child(debug_controls)
+	var tools_row := HBoxContainer.new()
+	tools_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	debug_controls.add_child(tools_row)
+	debug_card_picker = OptionButton.new()
+	for id: StringName in ExplorationDeck.DEFINITIONS:
+		var definition: Dictionary = ExplorationDeck.DEFINITIONS[id]
+		if definition.copies > 0:
+			debug_card_picker.add_item(definition.name)
+			debug_card_picker.set_item_metadata(debug_card_picker.item_count - 1, id)
+	tools_row.add_child(debug_card_picker)
+	action(tools_row, "Draw random", debug_draw.bind(false))
+	action(tools_row, "Draw selected", debug_draw.bind(true))
+	action(tools_row, "View piles", debug_view_piles)
+	var hand_row := HBoxContainer.new()
+	hand_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	debug_controls.add_child(hand_row)
+	debug_hero_picker = OptionButton.new()
+	hand_row.add_child(debug_hero_picker)
+	action(hand_row, "Give held card", debug_give_card)
+	action(hand_row, "Clear hand", debug_clear_hand)
+	action(hand_row, "Last effect", debug_last_effect)
+
+
+func debug_ready() -> bool:
+	return card_debug_enabled and hand_ready() and selected_card < 0
+
+
+func debug_draw(specific: bool) -> void:
+	if not debug_ready():
+		return
+	var id: StringName = &""
+	if specific:
+		id = debug_card_picker.get_selected_metadata()
+		if id in cards.deck:
+			cards.deck.erase(id)
+		else:
+			cards.discard.erase(id)
+	draw_exploration_card(heroes[active_player], id)
+	refresh("")
+
+
+func debug_view_piles() -> void:
+	if not debug_ready():
+		return
+	card_notice.title = "Exploration piles"
+	card_notice.dialog_text = "Deck (draws from the end)\n%s\n\nDiscard\n%s" % [", ".join(cards.deck), ", ".join(cards.discard)]
+	if DisplayServer.get_name() != "headless":
+		card_notice.popup_centered(Vector2i(540, 0))
+
+
+func debug_give_card() -> void:
+	if not debug_ready():
+		return
+	var id: StringName = debug_card_picker.get_selected_metadata()
+	if not ExplorationDeck.DEFINITIONS[id].held:
+		show_card_notice("Choose a Held card to give to a hero.")
+		return
+	show_card_notice(receive_held_card(heroes[debug_hero_picker.selected], id))
+	refresh("")
+
+
+func debug_clear_hand() -> void:
+	if not debug_ready():
+		return
+	var hero := heroes[debug_hero_picker.selected]
+	cards.discard.append_array(hero.hand)
+	hero.hand.clear()
+	refresh("Cleared %s’s hand." % hero.title)
+
+
+func debug_last_effect() -> void:
+	if debug_ready():
+		show_card_notice(last_card_effect if not last_card_effect.is_empty() else "No card has resolved yet.")
+
+
+func refresh_card_controls() -> void:
+	if card_debug_enabled:
+		debug_controls.visible = debug_ready()
+		if debug_hero_picker.item_count != heroes.size():
+			debug_hero_picker.clear()
+			for hero in heroes:
+				debug_hero_picker.add_item(hero.title)
+	card_counts.visible = phase == Phase.PLAYER or phase == Phase.ENEMY
+	card_counts.text = "Deck %d   ·   Discard %d" % [cards.deck.size(), cards.discard.size()]
+	if shield_hp > 0:
+		card_counts.text += "   ·   Fortress protection %d" % shield_hp
+	hand_controls.visible = phase == Phase.PLAYER
+	card_details.visible = phase == Phase.PLAYER
+	var id := selected_card_id()
+	var hand: Array[StringName] = []
+	if phase == Phase.PLAYER:
+		hand.assign(pending_owner.hand if pending_owner != null else heroes[active_player].hand)
+		if pending_owner != null:
+			hand.append(pending_card)
+	for index in range(hand_buttons.size()):
+		var button := hand_buttons[index]
+		button.visible = index < hand.size()
+		if button.visible:
+			var card_id := hand[index]
+			var name_text: String = ExplorationDeck.DEFINITIONS[card_id].name
+			button.text = name_text
+			if pending_owner != null:
+				button.text = ("Discard new: " if index == ExplorationDeck.HAND_LIMIT else "Discard: ") + name_text
+			button.tooltip_text = ExplorationDeck.description(card_id)
+			button.disabled = pending_owner == null and not can_select_card(card_id)
+	card_play.visible = id != &"" and pending_owner == null
+	card_play.disabled = not card_play_ready(id)
+	card_cancel.visible = card_play.visible
+	card_details.text = ExplorationDeck.description(id) if id != &"" else last_card_effect.get_slice("\n", last_card_effect.get_slice_count("\n") - 1)
+	if pending_owner != null:
+		card_details.text = "Hand full. Discard one existing card or the new card."
+
+
 func refresh(message: String) -> void:
 	var health_readout: Array[String] = ["Fortress %d/%d HP" % [integrity, MAX_INTEGRITY]]
 	for index in range(heroes.size()):
@@ -1081,7 +1515,9 @@ func refresh(message: String) -> void:
 	var options := reveal_options()
 	for node in range(markers.size()):
 		markers[node].material_override = idle_material
-		if drawn_tile < 0 and not aiming and node in legal_moves:
+		if selected_card >= 0 and card_can_target_space(node):
+			markers[node].material_override = endpoint_material if card_space == node else active_material
+		elif selected_card < 0 and pending_owner == null and drawn_tile < 0 and not aiming and node in legal_moves:
 			markers[node].material_override = active_material
 	if not options.is_empty() and not aiming:
 		markers[heroes[active_player].location].material_override = endpoint_material
@@ -1118,10 +1554,12 @@ func refresh(message: String) -> void:
 	rotate_button.disabled = drawn_tile < 0 or fitting_rotations(placement_target, drawn_tile).size() < 2
 	place_button.disabled = not tile_fits()
 	phase_button.visible = phase != Phase.COMPLETE
+	phase_button.disabled = pending_owner != null
 	attack_button.visible = phase == Phase.PLAYER
-	attack_button.disabled = tile_card.visible or attack_targets.is_empty()
+	attack_button.disabled = pending_owner != null or selected_card >= 0 or tile_card.visible or attack_targets.is_empty()
 	attack_button.text = "Cancel attack" if aiming else "Attack"
 	status.text = message
+	refresh_card_controls()
 
 	match phase:
 		Phase.TITLE:
@@ -1135,12 +1573,16 @@ func refresh(message: String) -> void:
 			var player := heroes[active_player]
 			var budget := player.budget
 			turn_status.text = "Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Reveals %d/%d   ·   Attack %d damage, range %d" % [
-				budget.movement_left, budget.max_movement, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
-				budget.energy, budget.max_energy, budget.reveals_left, HeroTurn.REVEALS_PER_TURN,
+				budget.movement_left, budget.movement_limit, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
+				budget.energy, budget.max_energy, budget.reveals_left, budget.reveal_limit,
 				player.attack_damage, player.attack_range,
 			]
 			phase_button.text = "End Player %d’s turn" % (active_player + 1)
-			if player.health == 0:
+			if pending_owner != null:
+				instructions.text = "Choose a card to discard before continuing."
+			elif selected_card >= 0:
+				instructions.text = card_target_instruction()
+			elif player.health == 0:
 				instructions.text = "Your hero was defeated. End your turn to continue."
 			elif tile_card.visible:
 				instructions.text = "Choose a gold space, then rotate or place the tile."

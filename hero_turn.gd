@@ -10,8 +10,11 @@ var energy: int:
 	set(value):
 		energy = clampi(value, 0, max_energy)
 var movement_left := 0
+var movement_limit := 0
+var next_movement_penalty := 0
 var actions_left := 0
 var reveals_left := 0
+var reveal_limit := 0
 var active := false
 
 var turns_started := 0
@@ -27,9 +30,12 @@ func _init(movement_allowance: int, starting_energy: int, energy_limit: int) -> 
 func begin_turn() -> void:
 	active = true
 	turns_started += 1
-	movement_left = max_movement
+	movement_limit = maxi(0, max_movement - next_movement_penalty)
+	movement_left = movement_limit
+	next_movement_penalty = 0
 	actions_left = ACTIONS_PER_TURN
-	reveals_left = REVEALS_PER_TURN
+	reveal_limit = REVEALS_PER_TURN
+	reveals_left = reveal_limit
 	energy += ENERGY_REGEN_PER_TURN
 
 

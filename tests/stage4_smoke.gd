@@ -87,8 +87,10 @@ func run() -> void:
 	terrain_board.toggle_reveal()
 	force_terrain(terrain_board, &"supply", 0, 2)
 	terrain_board.select_tile_location(Vector2i(0, -2))
+	terrain_board.cards.deck.assign([&"burst"])
 	terrain_board.place_tile()
-	assert(hero.budget.energy == 3 and "Stage 5" in terrain_board.status.text)
+	assert(hero.budget.energy == 3 and hero.hand == [&"burst"])
+	assert(terrain_board.cards.deck.is_empty())
 	assert(terrain_board.network.tiles[Vector2i(0, -2)].terrain.card_reward)
 	terrain_board.free()
 
