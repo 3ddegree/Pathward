@@ -1,5 +1,6 @@
 extends RefCounted
 
+const REVEALS_PER_TURN := 1
 const ACTIONS_PER_TURN := 2
 const ENERGY_REGEN_PER_TURN := 1
 
@@ -10,6 +11,7 @@ var energy: int:
 		energy = clampi(value, 0, max_energy)
 var movement_left := 0
 var actions_left := 0
+var reveals_left := 0
 var active := false
 
 var turns_started := 0
@@ -27,6 +29,7 @@ func begin_turn() -> void:
 	turns_started += 1
 	movement_left = max_movement
 	actions_left = ACTIONS_PER_TURN
+	reveals_left = REVEALS_PER_TURN
 	energy += ENERGY_REGEN_PER_TURN
 
 
@@ -34,6 +37,7 @@ func end_turn() -> void:
 	active = false
 	movement_left = 0
 	actions_left = 0
+	reveals_left = 0
 
 
 func spend_movement(points: int) -> bool:

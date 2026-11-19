@@ -1,6 +1,7 @@
 extends Node3D
 
 const RoadNetwork := preload("res://road_network.gd")
+const TerrainCatalog := preload("res://terrain_catalog.gd")
 const LANE_NAMES := ["1 North", "2 East", "3 South", "4 West"]
 const TILE_PORTS := [[0, 2], [0, 1], [0, 1, 3], [0, 1, 2, 3]]
 const TILE_NAMES := ["Straight", "Curve", "T-junction", "Four-way crossing"]
@@ -30,7 +31,7 @@ const WAVE_PLANS := [
 	],
 ]
 
-enum Phase { TITLE, SETUP, REVEAL, PLAYER, ENEMY, COMPLETE }
+enum Phase { TITLE, SETUP, PLAYER, ENEMY, COMPLETE }
 
 class Hero:
 	var id: StringName
@@ -66,6 +67,10 @@ var aiming := false
 var reveal_markers: Dictionary = {}
 var placement_target := Vector2i.ZERO
 var drawn_tile := -1
+var drawn_terrain: StringName
+var drawn_spaces := 0
+var exploration_cells: Array[Vector2i] = []
+var trap_labels: Dictionary[Vector2i, Label3D] = {}
 var rotation_steps := 0
 var preview: Node3D
 var wave_waiting := true
@@ -88,6 +93,9 @@ var turn_status: Label
 var dice_status: Label
 var tile_card: PanelContainer
 var drawn_tile_label: Label
+var terrain_description: Label
+var reveal_button: Button
+var endpoint_material: StandardMaterial3D
 var tile_diagram: Control
 var rotate_button: Button
 var place_button: Button
@@ -137,6 +145,7 @@ func _ready() -> void:
 	active_material = make_material(Color("#77ffe0"), true)
 	idle_material = make_material(Color("#f0d6a7"))
 	attack_material = make_material(Color("#ff9b66"), true)
+	endpoint_material = make_material(Color("#ffd16c"), true)
 	fortress_marker = block(network.positions[FORTRESS], Vector3(0.38, 0.07, 0.38), idle_material.albedo_color)
 	markers.append(fortress_marker)
 	build_fortress_health()
@@ -245,10 +254,18 @@ func build_heroes() -> void:
 		heroes.append(hero)
 
 
-func draw_tile(parent: Node3D, cell: Vector2i, ports: Array[int], tint: Color) -> void:
+func draw_tile(parent: Node3D, cell: Vector2i, ports: Array[int], terrain: Dictionary) -> void:
 	var center := network.center(cell)
+	var tint: Color = terrain.color
 	block(center, Vector3(1.96, 0.13, 1.96), tint, parent)
 	var road_color := tint.lightened(0.26)
+	if terrain.name.ends_with("Bridge"):
+		var axis := network.port(cell, ports[0]) - center
+		var side := Vector3(-axis.z, 0, axis.x) * 0.33
+		for offset: Vector3 in [side, -side]:
+			var rail := block(center + offset + Vector3.UP * 0.13, Vector3(0.08, 0.16, 1.94), Color("#c6a478"), parent)
+			rail.rotation.y = atan2(axis.x, axis.z)
+		road_color = Color("#b18d5b")
 	if ports.size() == 2:
 		var previous := network.road_point(cell, ports, 0.0)
 		for segment in range(1, 13):
@@ -267,13 +284,25 @@ func draw_road_segment(parent: Node3D, start: Vector3, finish: Vector3, color: C
 	piece.rotation.y = atan2(difference.x, difference.z)
 
 
-func lay_tile(cell: Vector2i, ports: Array[int], count: int) -> void:
-	var nodes := network.add_tile(cell, ports, count)
+func lay_tile(cell: Vector2i, ports: Array[int], count: int, terrain_id: StringName = &"road") -> bool:
+	var nodes := network.add_tile(cell, ports, count, terrain_id)
 	if nodes.is_empty():
-		return
-	draw_tile(self, cell, ports, Color("#92724f"))
+		return false
+	var terrain: Dictionary = TerrainCatalog.DEFINITIONS[terrain_id]
+	draw_tile(self, cell, ports, terrain)
 	for id in nodes:
 		markers.append(block(network.positions[id], Vector3(0.32, 0.045, 0.32), idle_material.albedo_color))
+	if terrain.effect == &"explosion":
+		var label := Label3D.new()
+		label.position = network.center(cell) + Vector3.UP * 0.49
+		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		label.pixel_size = 0.004
+		label.font_size = 32
+		label.outline_size = 12
+		label.text = "Trap armed"
+		add_child(label)
+		trap_labels[cell] = label
+	return true
 
 
 func add_lane_label(lane: int, cell: Vector2i) -> void:
@@ -317,6 +346,7 @@ func build_controls() -> void:
 	rows.add_child(controls)
 	place_button = action(controls, "Place tile", place_tile)
 	rotate_button = action(controls, "Rotate", rotate_tile)
+	reveal_button = action(controls, "Reveal tile", toggle_reveal)
 	attack_button = action(controls, "Attack", toggle_attack)
 	phase_button = action(controls, "Start game", advance_phase)
 	action(controls, "Reset view", reset_view)
@@ -343,6 +373,8 @@ func build_controls() -> void:
 	tile_card.add_child(card_content)
 	drawn_tile_label = centered_label(card_content)
 	drawn_tile_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	terrain_description = centered_label(card_content)
+	terrain_description.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	tile_diagram = Control.new()
 	tile_diagram.custom_minimum_size = Vector2(108, 108)
 	tile_diagram.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -451,9 +483,7 @@ func advance_phase() -> void:
 			update_player_count(player_count.selected)
 			build_heroes()
 			wave_plan = WAVE_PLANS[mini(heroes.size(), WAVE_PLANS.size()) - 1]
-			begin_tile_reveal("")
-		Phase.REVEAL:
-			begin_player_turn(0, "Tile placement skipped.")
+			begin_player_turn(0, "")
 		Phase.PLAYER:
 			begin_player_turn(active_player + 1, "")
 		Phase.ENEMY:
@@ -481,24 +511,51 @@ func begin_player_turn(index: int, message: String) -> void:
 
 func begin_next_round(message: String) -> void:
 	round_number += 1
-	begin_tile_reveal(message)
+	begin_player_turn(0, message)
 
 
-func begin_tile_reveal(message: String) -> void:
-	phase = Phase.REVEAL
-	drawn_tile = -1
-	placement_target = Vector2i.ZERO
-	rotation_steps = 0
-	var candidates: Array[int] = []
-	var cells := network.open_cells()
-	for kind in range(TILE_PORTS.size()):
-		for cell in cells:
+func can_reveal() -> bool:
+	if phase != Phase.PLAYER:
+		return false
+	var hero := heroes[active_player]
+	return hero.health > 0 and hero.budget.actions_left > 0 and hero.budget.reveals_left > 0
+
+
+func reveal_options() -> Dictionary:
+	var options := {}
+	if not can_reveal():
+		return options
+	for cell in network.expansion_cells(heroes[active_player].location):
+		for kind in range(TILE_PORTS.size()):
 			if not fitting_rotations(cell, kind).is_empty():
-				candidates.append(kind)
-				break
-	if not candidates.is_empty():
-		drawn_tile = candidates[randi_range(0, candidates.size() - 1)]
-	refresh(message)
+				if not options.has(kind):
+					options[kind] = []
+				options[kind].append(cell)
+	return options
+
+
+func toggle_reveal() -> void:
+	if drawn_tile >= 0:
+		drawn_tile = -1
+		placement_target = Vector2i.ZERO
+		refresh("Placement canceled.")
+		return
+	var options := reveal_options()
+	if options.is_empty():
+		return
+	var terrains: Array[StringName] = []
+	for id: StringName in TerrainCatalog.DEFINITIONS:
+		var terrain: Dictionary = TerrainCatalog.DEFINITIONS[id]
+		if terrain.shapes.any(func(shape: int) -> bool: return options.has(shape)):
+			terrains.append(id)
+	drawn_terrain = terrains.pick_random()
+	var definition: Dictionary = TerrainCatalog.DEFINITIONS[drawn_terrain]
+	var shapes: Array = definition.shapes.filter(func(shape: int) -> bool: return options.has(shape))
+	drawn_tile = shapes.pick_random()
+	drawn_spaces = definition.spaces.pick_random()
+	rotation_steps = 0
+	aiming = false
+	refresh("")
 
 
 func rotate_tile() -> void:
@@ -517,7 +574,7 @@ func oriented_ports(kind: int, rotation: int) -> Array[int]:
 
 
 func tile_fits() -> bool:
-	return drawn_tile >= 0 and network.fitting_lane(
+	return drawn_tile >= 0 and placement_target in exploration_cells and network.fitting_lane(
 		placement_target, oriented_ports(drawn_tile, rotation_steps)
 	) >= 0
 
@@ -532,6 +589,8 @@ func fitting_rotations(cell: Vector2i, kind: int) -> Array[int]:
 
 
 func select_tile_location(cell: Vector2i) -> void:
+	if not can_reveal() or drawn_tile < 0 or cell not in exploration_cells:
+		return
 	var rotations := fitting_rotations(cell, drawn_tile)
 	if rotations.is_empty():
 		return
@@ -544,7 +603,7 @@ func draw_tile_diagram() -> void:
 	if drawn_tile < 0:
 		return
 	var center := tile_diagram.size * 0.5
-	tile_diagram.draw_rect(Rect2(Vector2.ZERO, tile_diagram.size), Color("#73593f"))
+	tile_diagram.draw_rect(Rect2(Vector2.ZERO, tile_diagram.size), TerrainCatalog.DEFINITIONS[drawn_terrain].color)
 	var road := Color("#e8c99a")
 	var ports := oriented_ports(drawn_tile, rotation_steps)
 	if drawn_tile == 1:
@@ -566,12 +625,30 @@ func draw_tile_diagram() -> void:
 
 
 func place_tile() -> void:
-	if phase != Phase.REVEAL or not tile_fits():
+	if not can_reveal() or not tile_fits():
 		return
 	var ports := oriented_ports(drawn_tile, rotation_steps)
-	var count := (network.tiles.size() % 4) + 1
-	lay_tile(placement_target, ports, count)
-	begin_player_turn(0, "Road tile placed.")
+	if not lay_tile(placement_target, ports, drawn_spaces, drawn_terrain):
+		return
+	var hero := heroes[active_player]
+	hero.budget.spend_action()
+	hero.budget.reveals_left -= 1
+	var terrain: Dictionary = TerrainCatalog.DEFINITIONS[drawn_terrain]
+	var message := "%s placed." % terrain.name
+	match terrain.effect:
+		&"movement_loss":
+			var loss := mini(hero.budget.movement_left, terrain.parameters.amount)
+			hero.budget.movement_left -= loss
+			message += " Lost %d movement." % loss
+		&"energy_gain":
+			var before := hero.budget.energy
+			hero.budget.energy += int(terrain.parameters.amount)
+			message += " Restored %d Energy." % (hero.budget.energy - before)
+	if terrain.card_reward:
+		message += " Exploration card available in Stage 5."
+	drawn_tile = -1
+	placement_target = Vector2i.ZERO
+	refresh(message)
 
 
 func update_placement() -> void:
@@ -581,15 +658,19 @@ func update_placement() -> void:
 	if is_instance_valid(preview):
 		preview.queue_free()
 		preview = null
-	if phase != Phase.REVEAL or drawn_tile == -1:
+	exploration_cells.clear()
+	if drawn_tile < 0 or not can_reveal():
 		return
-	if placement_target != Vector2i.ZERO:
+	for cell in network.expansion_cells(heroes[active_player].location):
+		if fitting_rotations(cell, drawn_tile).is_empty():
+			continue
+		exploration_cells.append(cell)
+		if cell != placement_target:
+			reveal_markers[cell] = block(network.center(cell) + Vector3.UP * 0.10, Vector3(0.48, 0.07, 0.48), Color("#ffd16c"))
+	if tile_fits():
 		preview = Node3D.new()
 		add_child(preview)
-		draw_tile(preview, placement_target, oriented_ports(drawn_tile, rotation_steps), Color("#477b67"))
-	for cell in network.open_cells():
-		if cell != placement_target and not fitting_rotations(cell, drawn_tile).is_empty():
-			reveal_markers[cell] = block(network.center(cell) + Vector3.UP * 0.10, Vector3(0.48, 0.07, 0.48), Color("#ffd16c"))
+		draw_tile(preview, placement_target, oriented_ports(drawn_tile, rotation_steps), TerrainCatalog.DEFINITIONS[drawn_terrain])
 
 
 func reset_view() -> void:
@@ -622,10 +703,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		update_camera()
 		get_viewport().set_input_as_handled()
 		return
-	if click.button_index != MOUSE_BUTTON_LEFT or (phase != Phase.REVEAL and phase != Phase.PLAYER):
+	if click.button_index != MOUSE_BUTTON_LEFT or phase != Phase.PLAYER:
 		return
 
-	if phase == Phase.REVEAL:
+	if drawn_tile >= 0:
 		for cell: Vector2i in reveal_markers:
 			var marker: MeshInstance3D = reveal_markers[cell]
 			if camera.unproject_position(marker.position).distance_to(click.position) <= 21.0:
@@ -634,8 +715,6 @@ func _unhandled_input(event: InputEvent) -> void:
 				return
 		return
 
-	if phase != Phase.PLAYER:
-		return
 	if aiming:
 		click_attack_target(click.position)
 		return
@@ -714,7 +793,7 @@ func find_attack_targets() -> Array[Enemy]:
 
 
 func toggle_attack() -> void:
-	if phase == Phase.PLAYER and not attack_targets.is_empty():
+	if phase == Phase.PLAYER and drawn_tile < 0 and not attack_targets.is_empty():
 		aiming = not aiming
 		refresh("")
 
@@ -753,7 +832,7 @@ func monster_attack(hero: Hero, enemy: Enemy) -> String:
 
 
 func move_hero(destination: int) -> void:
-	if phase != Phase.PLAYER or aiming or not legal_moves.has(destination):
+	if phase != Phase.PLAYER or aiming or drawn_tile >= 0 or not legal_moves.has(destination):
 		return
 	var hero := heroes[active_player]
 	var cost: int = legal_moves[destination]
@@ -817,6 +896,28 @@ func remove_enemy(enemy: Enemy) -> void:
 	enemy.piece.queue_free()
 
 
+func trigger_entry_trap(enemy: Enemy, from: int) -> String:
+	var tile := network.tile_at(enemy.location)
+	if tile == null or tile == network.tile_at(from) or tile.trap_spent or tile.terrain.effect != &"explosion":
+		return ""
+	tile.enemy_entries += 1
+	if tile.enemy_entries < int(tile.terrain.parameters.threshold):
+		return ""
+	tile.trap_spent = true
+	var cell: Vector2i = network.cells_by_space[enemy.location]
+	trap_labels[cell].text = "Trap spent"
+	var blast: int = tile.terrain.parameters.damage
+	var defeated := 0
+	var occupants: Array[Enemy] = enemies.duplicate()
+	for target in occupants:
+		if network.tile_at(target.location) == tile:
+			target.health = 0 if blast == 0 else maxi(0, target.health - blast)
+			if target.health == 0:
+				remove_enemy(target)
+				defeated += 1
+	return "Trap detonated and defeated %d enemies." % defeated
+
+
 func resolve_enemies() -> void:
 	var damage := 0
 	var report: Array[String] = []
@@ -828,6 +929,8 @@ func resolve_enemies() -> void:
 			break
 	var marching: Array[Enemy] = enemies.duplicate()
 	for enemy in marching:
+		if enemy not in enemies:
+			continue
 		var defender := hero_at(enemy.location)
 		if defender != null:
 			report.append(monster_attack(defender, enemy))
@@ -838,7 +941,11 @@ func resolve_enemies() -> void:
 				break
 			var choice := 0
 			if routes.size() > 1:
-				choice = randi_range(0, routes.size() - 1)
+				var current_tile := network.tile_at(enemy.location)
+				if routes.size() == 2 and current_tile != null and current_tile.terrain.effect == &"fork":
+					choice = 0 if randf() < float(current_tile.terrain.parameters.first_branch_probability) else 1
+				else:
+					choice = randi_range(0, routes.size() - 1)
 				fork_rolls.append("%s d%d → %d" % [enemy.title, routes.size(), choice + 1])
 			var destination := routes[choice]
 			if destination == FORTRESS:
@@ -853,8 +960,14 @@ func resolve_enemies() -> void:
 				break
 			var heading := network.positions[destination] - network.positions[enemy.location]
 			enemy.piece.rotation.y = atan2(heading.x, heading.z)
+			var previous := enemy.location
 			enemy.location = destination
 			enemy.visited[destination] = true
+			var trap_message := trigger_entry_trap(enemy, previous)
+			if not trap_message.is_empty():
+				report.append(trap_message)
+			if enemy not in enemies:
+				break
 			if hero_at(destination) != null:
 				report.append("A %s moved into a hero’s space." % enemy.title)
 				break
@@ -902,8 +1015,13 @@ func refresh(message: String) -> void:
 	health_status.text = "    ·    ".join(health_readout)
 	legal_moves = find_moves()
 	attack_targets = find_attack_targets()
+	var options := reveal_options()
 	for node in range(markers.size()):
-		markers[node].material_override = active_material if not aiming and node in legal_moves else idle_material
+		markers[node].material_override = idle_material
+		if drawn_tile < 0 and not aiming and node in legal_moves:
+			markers[node].material_override = active_material
+	if not options.is_empty() and not aiming:
+		markers[heroes[active_player].location].material_override = endpoint_material
 	layout_enemies()
 	update_placement()
 	dice_status.text = dice_result
@@ -923,16 +1041,22 @@ func refresh(message: String) -> void:
 	fortress_health.text = "■".repeat(integrity) + "□".repeat(MAX_INTEGRITY - integrity)
 	fortress_health.modulate = Color("#9df4b7") if integrity > 2 else Color("#ff826d")
 	dice_status.visible = in_game
-	tile_card.visible = phase == Phase.REVEAL and drawn_tile >= 0
+	tile_card.visible = phase == Phase.PLAYER and drawn_tile >= 0
+	reveal_button.visible = phase == Phase.PLAYER
+	reveal_button.text = "Cancel reveal" if tile_card.visible else "Reveal tile"
+	reveal_button.disabled = aiming or (not tile_card.visible and options.is_empty())
 	place_button.visible = tile_card.visible
 	rotate_button.visible = tile_card.visible
-	drawn_tile_label.text = TILE_NAMES[drawn_tile] if drawn_tile >= 0 else ""
+	if tile_card.visible:
+		var terrain: Dictionary = TerrainCatalog.DEFINITIONS[drawn_terrain]
+		drawn_tile_label.text = "%s\n%s" % [terrain.name, TILE_NAMES[drawn_tile]]
+		terrain_description.text = terrain.description
 	tile_diagram.queue_redraw()
 	rotate_button.disabled = drawn_tile < 0 or fitting_rotations(placement_target, drawn_tile).size() < 2
 	place_button.disabled = not tile_fits()
 	phase_button.visible = phase != Phase.COMPLETE
 	attack_button.visible = phase == Phase.PLAYER
-	attack_button.disabled = attack_targets.is_empty()
+	attack_button.disabled = tile_card.visible or attack_targets.is_empty()
 	attack_button.text = "Cancel attack" if aiming else "Attack"
 	status.text = message
 
@@ -944,24 +1068,19 @@ func refresh(message: String) -> void:
 			status.text = "Game setup"
 			instructions.text = "Choose one distinct hero per player."
 			phase_button.text = "Begin game"
-		Phase.REVEAL:
-			phase_button.text = "Skip tile" if drawn_tile >= 0 else "Continue"
-			if drawn_tile == -1:
-				instructions.text = "No road tile fits. Continue to the player turns."
-			elif placement_target == Vector2i.ZERO:
-				instructions.text = "Choose a gold space for the revealed tile."
-			else:
-				instructions.text = "Place the tile, or choose another gold space." if rotate_button.disabled else "Rotate, place, or choose another gold space."
 		Phase.PLAYER:
 			var player := heroes[active_player]
 			var budget := player.budget
-			turn_status.text = "Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Attack %d damage, range %d" % [
+			turn_status.text = "Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Reveals %d/%d   ·   Attack %d damage, range %d" % [
 				budget.movement_left, budget.max_movement, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
-				budget.energy, budget.max_energy, player.attack_damage, player.attack_range,
+				budget.energy, budget.max_energy, budget.reveals_left, HeroTurn.REVEALS_PER_TURN,
+				player.attack_damage, player.attack_range,
 			]
 			phase_button.text = "End Player %d’s turn" % (active_player + 1)
 			if player.health == 0:
 				instructions.text = "Your hero was defeated. End your turn to continue."
+			elif tile_card.visible:
+				instructions.text = "Choose a gold space, then rotate or place the tile."
 			elif aiming:
 				instructions.text = "Click an orange-marked monster to attack."
 			else:
@@ -975,7 +1094,12 @@ func refresh(message: String) -> void:
 					attack_status = "No actions left"
 				elif attack_targets.is_empty():
 					attack_status = "No monsters in range"
-				instructions.text = "%s   ·   %s" % [move_status, attack_status]
+				var reveal_status := "Reach an open road endpoint to reveal a tile"
+				if budget.reveals_left == 0:
+					reveal_status = "Reveal used"
+				elif not options.is_empty():
+					reveal_status = "Reveal tile for 1 action"
+				instructions.text = "%s   ·   %s   ·   %s" % [move_status, attack_status, reveal_status]
 		Phase.ENEMY:
 			if wave_waiting:
 				phase_button.text = "Roll wave · d4"
@@ -987,7 +1111,7 @@ func refresh(message: String) -> void:
 			instructions.text = "Choose Restart to start a new game."
 
 	if in_game:
-		var phase_title := "Reveal tile phase"
+		var phase_title := ""
 		match phase:
 			Phase.PLAYER:
 				phase_title = "Player %d’s turn · %s" % [active_player + 1, heroes[active_player].title]

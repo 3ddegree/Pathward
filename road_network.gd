@@ -1,5 +1,6 @@
 extends RefCounted
 
+const TerrainCatalog := preload("res://terrain_catalog.gd")
 const DIRECTIONS := [Vector2i.UP, Vector2i.RIGHT, Vector2i.DOWN, Vector2i.LEFT]
 const TILE_SIZE := 2.0
 const BOARD_RADIUS := 4
@@ -8,8 +9,13 @@ const FORTRESS := 0
 class Tile:
 	var lane: int
 	var endpoints: Dictionary = {}
+	var terrain_id: StringName
+	var terrain: Dictionary
+	var enemy_entries := 0
+	var trap_spent := false
 
 var tiles: Dictionary = {}
+var cells_by_space: Dictionary[int, Vector2i] = {}
 var positions: Array[Vector3] = [Vector3(0, 0.56, 0)]
 var links: Array = [[]]
 
@@ -36,6 +42,27 @@ func open_cells() -> Array[Vector2i]:
 			if next != Vector2i.ZERO and not tiles.has(next) and not cells.has(next) and maxi(absi(next.x), absi(next.y)) <= BOARD_RADIUS:
 				cells.append(next)
 	return cells
+
+
+func expansion_cells(location: int) -> Array[Vector2i]:
+	var cells: Array[Vector2i] = []
+	if not cells_by_space.has(location):
+		return cells
+	var cell := cells_by_space[location]
+	var tile: Tile = tiles[cell]
+	for direction: int in tile.endpoints:
+		if tile.endpoints[direction] != location:
+			continue
+		var next: Vector2i = cell + DIRECTIONS[direction]
+		if next != Vector2i.ZERO and not tiles.has(next) and maxi(absi(next.x), absi(next.y)) <= BOARD_RADIUS:
+			cells.append(next)
+	return cells
+
+
+func tile_at(location: int) -> Tile:
+	if cells_by_space.has(location):
+		return tiles[cells_by_space[location]]
+	return null
 
 
 func fitting_lane(cell: Vector2i, ports: Array[int]) -> int:
@@ -65,11 +92,13 @@ func road_point(cell: Vector2i, ports: Array[int], progress: float) -> Vector3:
 	return start.lerp(midpoint, progress).lerp(midpoint.lerp(end, progress), progress)
 
 
-func add_tile(cell: Vector2i, ports: Array[int], count: int) -> Array[int]:
+func add_tile(cell: Vector2i, ports: Array[int], count: int, terrain_id: StringName = &"road") -> Array[int]:
 	var tile := Tile.new()
 	tile.lane = fitting_lane(cell, ports)
 	if tile.lane < 0:
 		return []
+	tile.terrain_id = terrain_id
+	tile.terrain = TerrainCatalog.DEFINITIONS[terrain_id]
 	tiles[cell] = tile
 	var nodes: Array[int] = []
 	if ports.size() == 2:
@@ -85,6 +114,18 @@ func add_tile(cell: Vector2i, ports: Array[int], count: int) -> Array[int]:
 		nodes.append(crossing)
 		for direction in ports:
 			tile.endpoints[direction] = crossing
+	elif tile.terrain.effect == &"fork":
+		var hub := add_space(center(cell))
+		var middle := add_space(center(cell).lerp(port(cell, ports[1]), 0.66))
+		var long_start := add_space(center(cell).lerp(port(cell, ports[2]), 0.35))
+		var long_end := add_space(center(cell).lerp(port(cell, ports[2]), 0.72))
+		nodes.assign([hub, middle, long_start, long_end])
+		tile.endpoints[ports[0]] = hub
+		tile.endpoints[ports[1]] = middle
+		tile.endpoints[ports[2]] = long_end
+		connect_spaces(hub, middle)
+		connect_spaces(hub, long_start)
+		connect_spaces(long_start, long_end)
 	else:
 		var junction := add_space(center(cell))
 		nodes.append(junction)
@@ -93,6 +134,8 @@ func add_tile(cell: Vector2i, ports: Array[int], count: int) -> Array[int]:
 			nodes.append(branch)
 			tile.endpoints[direction] = branch
 			connect_spaces(junction, branch)
+	for node in nodes:
+		cells_by_space[node] = cell
 	for direction: int in tile.endpoints:
 		var next: Vector2i = cell + DIRECTIONS[direction]
 		var endpoint: int = tile.endpoints[direction]
