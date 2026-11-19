@@ -1160,6 +1160,8 @@ func refresh(message: String) -> void:
 				var reveal_status := "Reach an open road endpoint to reveal a tile"
 				if budget.reveals_left == 0:
 					reveal_status = "Reveal used"
+				elif budget.actions_left == 0:
+					reveal_status = "Reveal needs 1 action"
 				elif not options.is_empty():
 					reveal_status = "Reveal tile for 1 action"
 				instructions.text = "%s   ·   %s   ·   %s" % [move_status, attack_status, reveal_status]

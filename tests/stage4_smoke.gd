@@ -36,6 +36,13 @@ func run() -> void:
 			board.move_hero(endpoint)
 			assert(hero.location == endpoint and not board.reveal_button.disabled)
 			var movement: int = hero.budget.movement_left
+			hero.budget.actions_left = 0
+			board.refresh("")
+			assert(board.reveal_button.disabled and "Reveal needs 1 action" in board.instructions.text)
+			board.toggle_reveal()
+			assert(board.drawn_tile < 0)
+			hero.budget.actions_left = 2
+			board.refresh("")
 			board.toggle_reveal()
 			assert(board.drawn_tile >= 0)
 			board.place_tile()
@@ -45,6 +52,10 @@ func run() -> void:
 			board.toggle_reveal()
 			force_terrain(board, &"road", 1, 1)
 			var cell: Vector2i = board.exploration_cells[0]
+			board.select_tile_location(Vector2i.ZERO)
+			board.place_tile()
+			assert(board.placement_target == Vector2i.ZERO)
+			assert(hero.budget.actions_left == 2 and hero.budget.reveals_left == 1)
 			board.select_tile_location(cell)
 			assert(board.tile_fits())
 			var old_rotation: int = board.rotation_steps
@@ -103,12 +114,23 @@ func run() -> void:
 	for enemy in traps.enemies:
 		enemy.location = from
 		enemy.visited = {from: true}
-	traps.advance_phase()
-	traps.advance_phase()
 	var tile = traps.network.tiles[Vector2i(2, 0)]
+	var blocker = traps.heroes[0]
+	blocker.location = tile.endpoints[1]
+	traps.refresh("")
+	traps.advance_phase()
+	traps.advance_phase()
+	assert(tile.enemy_entries == 0 and not tile.trap_spent)
+	assert(traps.enemies.all(func(enemy: Tabletop.Enemy) -> bool: return enemy.location == from))
+	assert(blocker.health == blocker.max_health - 2 and traps.integrity == 5)
+	var health_after_attacks: int = blocker.health
+	traps.move_hero(tile.endpoints[3])
+	assert(blocker.location == tile.endpoints[3])
+	traps.advance_phase()
+	traps.advance_phase()
 	assert(tile.enemy_entries == 2 and tile.trap_spent and traps.enemies.is_empty())
 	assert(traps.trap_labels[Vector2i(2, 0)].text == "Trap spent")
-	assert(traps.integrity == 5 and traps.heroes[0].health == traps.heroes[0].max_health)
+	assert(traps.integrity == 5 and blocker.health == health_after_attacks)
 	traps.free()
 
 	var fork = make_board(1)
