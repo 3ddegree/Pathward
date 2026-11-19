@@ -7,10 +7,8 @@ const TILE_NAMES := ["Straight", "Curve", "T-junction", "Four-way crossing"]
 const MAX_INTEGRITY := 5
 const FORTRESS := 0
 const START_VIEW := Vector3(0.38, 0.87, 23.0)
-const HEROES := [
-	{"name": "Warden", "color": Color("#4de1d1"), "stride": 1, "range": 1, "health": 5},
-	{"name": "Scout", "color": Color("#a8ef85"), "stride": 2, "range": 3, "health": 4},
-]
+const HeroCatalog := preload("res://hero_catalog.gd")
+const MAX_PLAYERS := 5
 const ENEMY_TYPES := {
 	"Grunt": {"stride": 1, "damage": 1, "health": 1, "color": Color("#ff865e")},
 	"Runner": {"stride": 2, "damage": 1, "health": 1, "color": Color("#f4ce63")},
@@ -34,6 +32,8 @@ const WAVE_PLANS := [
 enum Phase { TITLE, SETUP, REVEAL, PLAYER, ENEMY, COMPLETE }
 
 class Hero:
+	var id: StringName
+	var attack_damage: int
 	var title: String
 	var stride: int
 	var max_health: int
@@ -94,7 +94,9 @@ var place_button: Button
 var phase_button: Button
 var attack_button: Button
 var attack_material: StandardMaterial3D
-var setup_controls: HBoxContainer
+var setup_controls: VBoxContainer
+var roster_picker: OptionButton
+var hero_details: Label
 var player_count: OptionButton
 var character_pickers: Array[OptionButton] = []
 var status: Label
@@ -221,11 +223,13 @@ func miniature(title: String, color: Color) -> Node3D:
 
 func build_heroes() -> void:
 	for index in range(player_count.selected + 1):
-		var entry: Dictionary = HEROES[character_pickers[index].selected]
+		var entry: Dictionary = HeroCatalog.DEFINITIONS[character_pickers[index].selected]
 		var hero := Hero.new()
+		hero.id = entry["id"]
 		hero.title = entry["name"]
-		hero.stride = entry["stride"]
-		hero.attack_range = entry["range"]
+		hero.stride = entry["current_movement"]
+		hero.attack_damage = entry["attack_damage"]
+		hero.attack_range = entry["attack_range"]
 		hero.max_health = entry["health"]
 		hero.health = hero.max_health
 		hero.location = FORTRESS
@@ -323,24 +327,7 @@ func build_controls() -> void:
 	status = centered_label(rows)
 	instructions = centered_label(rows)
 
-	setup_controls = HBoxContainer.new()
-	setup_controls.alignment = BoxContainer.ALIGNMENT_CENTER
-	rows.add_child(setup_controls)
-	player_count = OptionButton.new()
-	player_count.add_item("1 player")
-	player_count.add_item("2 players")
-	player_count.select(1)
-	player_count.item_selected.connect(update_player_count)
-	setup_controls.add_child(player_count)
-	for index in range(2):
-		var picker := OptionButton.new()
-		for entry: Dictionary in HEROES:
-			picker.add_item("P%d  %s" % [index + 1, entry["name"]])
-		picker.select(index)
-		picker.item_selected.connect(select_character.bind(index))
-		character_pickers.append(picker)
-		setup_controls.add_child(picker)
-
+	build_setup_controls(rows)
 
 	tile_card = PanelContainer.new()
 	tile_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -361,6 +348,48 @@ func build_controls() -> void:
 	tile_diagram.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	tile_diagram.draw.connect(draw_tile_diagram)
 	card_content.add_child(tile_diagram)
+
+
+func build_setup_controls(parent: VBoxContainer) -> void:
+	setup_controls = VBoxContainer.new()
+	parent.add_child(setup_controls)
+	var roster_controls := HBoxContainer.new()
+	roster_controls.alignment = BoxContainer.ALIGNMENT_CENTER
+	setup_controls.add_child(roster_controls)
+	player_count = OptionButton.new()
+	player_count.add_item("1 player")
+	for count in range(2, MAX_PLAYERS + 1):
+		player_count.add_item("%d players" % count)
+	player_count.select(1)
+	player_count.item_selected.connect(update_player_count)
+	roster_controls.add_child(player_count)
+
+	var roster_label := Label.new()
+	roster_label.text = "Hero reference"
+	roster_controls.add_child(roster_label)
+	roster_picker = OptionButton.new()
+	for entry: Dictionary in HeroCatalog.DEFINITIONS:
+		roster_picker.add_item(entry["name"])
+	roster_picker.item_selected.connect(show_hero_details)
+	roster_controls.add_child(roster_picker)
+	hero_details = centered_label(setup_controls)
+	hero_details.add_theme_constant_override("line_spacing", 4)
+
+	var assignments := HFlowContainer.new()
+	assignments.alignment = FlowContainer.ALIGNMENT_CENTER
+	setup_controls.add_child(assignments)
+	for index in range(MAX_PLAYERS):
+		var picker := OptionButton.new()
+		for hero_index in range(HeroCatalog.DEFINITIONS.size()):
+			var entry: Dictionary = HeroCatalog.DEFINITIONS[hero_index]
+			picker.add_item("P%d  %s" % [index + 1, entry["name"]])
+			picker.get_popup().set_item_tooltip(hero_index, HeroCatalog.summary(hero_index))
+		picker.select(index)
+		picker.item_selected.connect(select_character)
+		character_pickers.append(picker)
+		assignments.add_child(picker)
+	update_player_count(player_count.selected)
+	show_hero_details(0)
 
 
 func centered_label(parent: BoxContainer) -> Label:
@@ -384,16 +413,32 @@ func restart() -> void:
 
 
 func update_player_count(index: int) -> void:
-	character_pickers[1].visible = index == 1
-	if index == 1:
-		select_character(character_pickers[0].selected, 0)
+	var assigned: Array[int] = []
+	for player in range(character_pickers.size()):
+		var picker := character_pickers[player]
+		picker.visible = player <= index
+		if not picker.visible:
+			continue
+		if picker.selected in assigned:
+			for hero_index in range(HeroCatalog.DEFINITIONS.size()):
+				if hero_index not in assigned:
+					picker.select(hero_index)
+					break
+		assigned.append(picker.selected)
+	for player in range(index + 1):
+		var picker := character_pickers[player]
+		for hero_index in range(HeroCatalog.DEFINITIONS.size()):
+			picker.set_item_disabled(hero_index, hero_index != picker.selected and hero_index in assigned)
 
 
-func select_character(character_index: int, player_index: int) -> void:
-	if player_count.selected == 1:
-		var other := character_pickers[1 - player_index]
-		if other.selected == character_index:
-			other.select(1 - character_index)
+func show_hero_details(index: int) -> void:
+	roster_picker.select(index)
+	hero_details.text = HeroCatalog.summary(index)
+
+
+func select_character(character_index: int) -> void:
+	update_player_count(player_count.selected)
+	show_hero_details(character_index)
 
 
 func advance_phase() -> void:
@@ -402,8 +447,9 @@ func advance_phase() -> void:
 			phase = Phase.SETUP
 			refresh("")
 		Phase.SETUP:
+			update_player_count(player_count.selected)
 			build_heroes()
-			wave_plan = WAVE_PLANS[heroes.size() - 1]
+			wave_plan = WAVE_PLANS[mini(heroes.size(), WAVE_PLANS.size()) - 1]
 			begin_tile_reveal("")
 		Phase.REVEAL:
 			begin_player_turn(0, "Tile placement skipped.")
@@ -684,7 +730,7 @@ func click_attack_target(click: Vector2) -> void:
 		var hero := heroes[active_player]
 		hero.attacked = true
 		aiming = false
-		nearest.health -= 1
+		nearest.health = maxi(0, nearest.health - hero.attack_damage)
 		if nearest.health == 0:
 			remove_enemy(nearest)
 			refresh("%s defeated a %s." % [hero.title, nearest.title])
@@ -769,7 +815,7 @@ func resolve_enemies() -> void:
 	fork_rolls.clear()
 	var warden: Hero
 	for hero in heroes:
-		if hero.title == "Warden":
+		if hero.id == &"warden":
 			warden = hero
 			break
 	var marching: Array[Enemy] = enemies.duplicate()
@@ -836,7 +882,11 @@ func refresh(message: String) -> void:
 		var hero := heroes[index]
 		hero.piece.position = network.positions[hero.location]
 		if hero.location == FORTRESS:
-			hero.piece.position.x += -0.36 if index == 0 else 0.36
+			if heroes.size() <= 2:
+				hero.piece.position.x += -0.36 if index == 0 else 0.36
+			else:
+				var angle := TAU * index / heroes.size()
+				hero.piece.position += Vector3(sin(angle), 0, cos(angle)) * 0.58
 		hero.piece.visible = hero.health > 0
 		hero.base.material_override = active_material if phase == Phase.PLAYER and index == active_player else idle_material
 		hero.health_label.text = "%d/%d" % [hero.health, hero.max_health]
@@ -883,7 +933,7 @@ func refresh(message: String) -> void:
 			phase_button.text = "Start game"
 		Phase.SETUP:
 			status.text = "Game setup"
-			instructions.text = "Choose your players. Warden uses melee (1 space). Scout attacks at range (3 spaces)."
+			instructions.text = "Choose one distinct hero per player."
 			phase_button.text = "Begin game"
 		Phase.REVEAL:
 			phase_button.text = "Skip tile" if drawn_tile >= 0 else "Continue"
