@@ -76,7 +76,7 @@ func run() -> void:
 				assert(hero.location == 0)
 			board.advance_phase()
 		board.advance_phase()
-		assert(board.enemies.size() == (2 if count == 1 else 3))
+		assert(board.enemies.size() == (1 if count <= 2 else 2))
 		assert(board.heroes[0].budget.reveals_left == 1)
 		board.free()
 
@@ -112,8 +112,12 @@ func run() -> void:
 	assert(not load("res://terrain_catalog.gd").DEFINITIONS[&"lava_bridge"].tower_allowed)
 	traps.advance_phase()
 	traps.advance_phase()
+	traps.waves.pending.clear()
+	traps.spawn_enemy("Grunt")
 	var from: int = traps.network.tiles[Vector2i(3, 0)].endpoints[3]
 	for enemy in traps.enemies:
+		enemy.stride = 1
+		enemy.attack_damage = 1
 		enemy.location = from
 		enemy.visited = {from: true}
 	var tile = traps.network.tiles[Vector2i(2, 0)]

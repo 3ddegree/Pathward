@@ -185,6 +185,8 @@ func entry_for_lane(lane: int) -> int:
 			continue
 		for direction: int in tile.endpoints:
 			var endpoint: int = tile.endpoints[direction]
+			if not distances.has(endpoint):
+				continue
 			if fallback == -1 or distances[endpoint] > distances[fallback]:
 				fallback = endpoint
 			var next: Vector2i = cell + DIRECTIONS[direction]

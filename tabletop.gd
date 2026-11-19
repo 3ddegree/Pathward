@@ -1,5 +1,6 @@
 extends Node3D
 
+const WaveSchedule := preload("res://wave_schedule.gd")
 const ExplorationDeck := preload("res://exploration_deck.gd")
 const RoadNetwork := preload("res://road_network.gd")
 const TerrainCatalog := preload("res://terrain_catalog.gd")
@@ -18,21 +19,7 @@ const ENEMY_TYPES := {
 	"Brute": {"stride": 1, "breach_damage": 2, "attack_damage": 2, "health": 2, "color": Color("#f46ea5")},
 	"Boss": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 3, "color": Color("#be8cff"), "remove_on_breach": false},
 }
-const WAVE_PLANS := [
-	[
-		["Grunt", "Grunt"],
-		["Grunt", "Runner", "Brute"],
-		["Grunt", "Runner", "Brute", "Boss"],
-	],
-	[
-		["Grunt", "Grunt", "Grunt"],
-		["Grunt", "Grunt", "Runner", "Brute"],
-		["Grunt", "Grunt", "Runner", "Brute", "Brute"],
-		["Grunt", "Grunt", "Runner", "Brute", "Brute", "Boss"],
-	],
-]
-
-enum Phase { TITLE, SETUP, PLAYER, ENEMY, COMPLETE }
+enum Phase { TITLE, SETUP, PLAYER, ENEMY, ROUND_START, COMPLETE }
 enum FrontlineOrder { FIRST_PLAYER, LAST_PLAYER }
 
 @export var frontline_order: FrontlineOrder = FrontlineOrder.FIRST_PLAYER
@@ -63,6 +50,7 @@ class Enemy:
 	var breach_damage: int
 	var attack_damage: int
 	var remove_on_breach: bool
+	var spawn_lane: int
 	var blocked_destination := -1
 	var skip_movement := 0
 	var attack_animation: Tween
@@ -87,7 +75,6 @@ var exploration_cells: Array[Vector2i] = []
 var trap_labels: Dictionary[Vector2i, Label3D] = {}
 var rotation_steps := 0
 var preview: Node3D
-var wave_waiting := true
 var dice_result := ""
 var fork_rolls: Array[String] = []
 var round_number := 1
@@ -96,7 +83,6 @@ var active_player := 0
 @export var exploration_seed := 0
 var cards := ExplorationDeck.new()
 var shield_hp := 0
-var extra_grunts := 0
 var pending_card: StringName
 var pending_owner: Hero
 var selected_card := -1
@@ -114,8 +100,19 @@ var debug_controls: VBoxContainer
 var debug_card_picker: OptionButton
 var debug_hero_picker: OptionButton
 var card_debug_enabled := OS.is_debug_build() and "--pathward-card-debug" in OS.get_cmdline_user_args()
-var wave := 0
-var wave_plan: Array = []
+@export var wave_seed := 0
+@export_range(0, 12) var wave_round_override := 0
+var waves := WaveSchedule.new()
+var final_boss: Enemy
+var boss_spawned := false
+var boss_defeated := false
+var wave_status: Label
+var wave_debug_enabled := OS.is_debug_build() and "--pathward-wave-debug" in OS.get_cmdline_user_args()
+var wave_debug_setup: HBoxContainer
+var wave_debug_live: HBoxContainer
+var debug_wave_picker: OptionButton
+var debug_wave_seed: SpinBox
+var debug_enemy_picker: OptionButton
 var integrity := MAX_INTEGRITY
 var heroes: Array[Hero] = []
 var warden_defended := false
@@ -402,11 +399,14 @@ func build_controls() -> void:
 	health_status = centered_label(rows)
 	turn_status = centered_label(rows)
 	dice_status = centered_label(rows)
+	wave_status = centered_label(rows)
 	status = centered_label(rows)
 	instructions = centered_label(rows)
 
 	build_setup_controls(rows)
 	build_card_controls(rows, overlay)
+	if wave_debug_enabled:
+		build_wave_debug(rows)
 
 	tile_card = PanelContainer.new()
 	tile_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -534,16 +534,17 @@ func advance_phase() -> void:
 		Phase.SETUP:
 			update_player_count(player_count.selected)
 			build_heroes()
-			wave_plan = WAVE_PLANS[mini(heroes.size(), WAVE_PLANS.size()) - 1]
-			begin_player_turn(0, "")
+			waves.round_override = wave_round_override
+			var start := debug_wave_picker.selected + 1 if wave_debug_enabled else 1
+			var seed_value := int(debug_wave_seed.value) if wave_debug_enabled else wave_seed
+			waves.reset(heroes.size(), seed_value, start)
+			begin_player_turn(0, wave_announcement())
 		Phase.PLAYER:
 			begin_player_turn(active_player + 1, "")
 		Phase.ENEMY:
-			if wave_waiting:
-				roll_wave()
-				begin_next_round("Enemies entered their rolled lanes.")
-			else:
-				resolve_enemies()
+			resolve_enemies()
+		Phase.ROUND_START:
+			begin_player_turn(0, "")
 
 
 func begin_player_turn(index: int, message: String) -> void:
@@ -564,7 +565,11 @@ func begin_player_turn(index: int, message: String) -> void:
 
 func begin_next_round(message: String) -> void:
 	round_number += 1
-	begin_player_turn(0, message)
+	if heroes.any(func(hero: Hero) -> bool: return hero.health > 0):
+		begin_player_turn(0, message)
+	else:
+		phase = Phase.ROUND_START
+		refresh(message)
 
 
 func can_reveal() -> bool:
@@ -922,35 +927,43 @@ func move_hero(destination: int) -> void:
 		refresh("%s moved %d %s." % [hero.title, cost, "space" if cost == 1 else "spaces"])
 
 
-func roll_wave() -> void:
-	if not wave_waiting or phase != Phase.ENEMY:
-		return
-	wave_waiting = false
-	fork_rolls.clear()
-	warden_defended = false
+func spawn_due_enemies(report: Array[String]) -> void:
 	var rolls: Array[String] = []
-	var composition: Array = wave_plan[wave].duplicate()
-	for _extra in range(extra_grunts):
-		composition.append("Grunt")
-	extra_grunts = 0
-	for title: String in composition:
-		var lane := spawn_enemy(title)
-		if lane >= 0:
-			rolls.append("%s → %s" % [title, LANE_NAMES[lane]])
-	dice_result = "Lane d4   " + "  ·  ".join(rolls)
+	var deferred := 0
+	for entry in waves.due_spawns():
+		var lane := spawn_enemy(entry.kind)
+		if lane < 0:
+			deferred += 1
+			continue
+		rolls.append("%s → %s" % [entry.kind, LANE_NAMES[lane]])
+		waves.pending.erase(entry)
+	dice_result = "Lane d4   " + "  ·  ".join(rolls) if not rolls.is_empty() else ""
+	if not rolls.is_empty():
+		report.append("%d monsters spawned." % rolls.size())
+	if deferred > 0:
+		report.append("%d spawns deferred. No valid lane." % deferred)
+
+
+func wave_announcement() -> String:
+	if waves.current_wave == WaveSchedule.CONFIG.size():
+		return "Wave %d begins. Boss incoming!" % waves.current_wave
+	return "Wave %d begins." % waves.current_wave
 
 
 func spawn_enemy(title: String) -> int:
+	if title == WaveSchedule.BOSS_TYPE and (waves.current_wave != WaveSchedule.CONFIG.size() or boss_spawned):
+		return -1
 	var valid_lanes: Array[int] = []
 	for lane in range(LANE_NAMES.size()):
 		if network.entry_for_lane(lane) > FORTRESS:
 			valid_lanes.append(lane)
 	if valid_lanes.is_empty():
 		return -1
-	var lane: int = valid_lanes.pick_random()
+	var lane := valid_lanes[waves.rng.randi_range(0, valid_lanes.size() - 1)]
 	var entry: Dictionary = ENEMY_TYPES[title]
 	var enemy := Enemy.new()
 	enemy.title = title
+	enemy.spawn_lane = lane
 	enemy.stride = entry["stride"]
 	enemy.breach_damage = entry["breach_damage"]
 	enemy.attack_damage = entry.get("attack_damage", 1)
@@ -972,6 +985,9 @@ func spawn_enemy(title: String) -> int:
 	enemy.target_marker = block(Vector3.ZERO, Vector3(0.45, 0.045, 0.45), Color.WHITE, enemy.piece)
 	enemy.target_marker.material_override = attack_material
 	enemies.append(enemy)
+	if title == WaveSchedule.BOSS_TYPE:
+		final_boss = enemy
+		boss_spawned = true
 	return lane
 
 
@@ -990,6 +1006,9 @@ func layout_enemies() -> void:
 
 
 func remove_enemy(enemy: Enemy) -> void:
+	if enemy == final_boss:
+		final_boss = null
+		boss_defeated = true
 	enemies.erase(enemy)
 	enemy.piece.queue_free()
 
@@ -1017,7 +1036,7 @@ func trigger_entry_trap(enemy: Enemy, from: int) -> String:
 
 
 func resolve_enemies() -> void:
-	if phase != Phase.ENEMY or wave_waiting:
+	if phase != Phase.ENEMY or waves.completed_turns + 1 != round_number:
 		return
 	var damage := 0
 	var report: Array[String] = []
@@ -1050,9 +1069,9 @@ func resolve_enemies() -> void:
 				if routes.size() > 1:
 					var current_tile := network.tile_at(enemy.location)
 					if routes.size() == 2 and current_tile != null and current_tile.terrain.effect == &"fork":
-						choice = 0 if randf() < float(current_tile.terrain.parameters.first_branch_probability) else 1
+						choice = 0 if waves.rng.randf() < float(current_tile.terrain.parameters.first_branch_probability) else 1
 					else:
-						choice = randi_range(0, routes.size() - 1)
+						choice = waves.rng.randi_range(0, routes.size() - 1)
 					fork_rolls.append("%s d%d → %d" % [enemy.title, routes.size(), choice + 1])
 			var destination := routes[choice]
 			if destination == FORTRESS:
@@ -1089,16 +1108,17 @@ func resolve_enemies() -> void:
 	if damage > 0:
 		report.append("Fortress lost %d HP." % damage)
 	if integrity == 0:
+		waves.complete_turn()
 		phase = Phase.COMPLETE
 		report.append("The base was destroyed.")
-	elif enemies.is_empty():
-		if wave == wave_plan.size() - 1:
+	else:
+		spawn_due_enemies(report)
+		if waves.complete_turn():
+			warden_defended = false
+			report.append(wave_announcement())
+		if waves.pending.is_empty() and enemies.is_empty() and boss_defeated:
 			phase = Phase.COMPLETE
-			report.append("The fortress held through all %d waves." % wave_plan.size())
-		else:
-			wave += 1
-			wave_waiting = true
-			report.append("Ready to roll the next wave.")
+			report.append("The fortress held through all %d waves." % WaveSchedule.CONFIG.size())
 	if report.is_empty():
 		report.append("Enemies advanced.")
 	var message := " ".join(report)
@@ -1202,9 +1222,8 @@ func resolve_immediate_card(hero: Hero, card: Dictionary) -> String:
 			cards.discard.append(lost_card)
 			return "Discarded %s." % ExplorationDeck.DEFINITIONS[lost_card].name
 		&"reinforce":
-			if not wave_waiting and wave + 1 >= wave_plan.size():
+			if not waves.add_reinforcements(amount):
 				return "No later wave is scheduled."
-			extra_grunts += amount
 			return "Added one Grunt to the next unspawned wave."
 		&"exhaust":
 			hero.budget.next_movement_penalty += amount
@@ -1489,6 +1508,106 @@ func refresh_card_controls() -> void:
 		card_details.text = "Hand full. Discard one existing card or the new card."
 
 
+func build_wave_debug(rows: VBoxContainer) -> void:
+	wave_debug_setup = HBoxContainer.new()
+	wave_debug_setup.alignment = BoxContainer.ALIGNMENT_CENTER
+	rows.add_child(wave_debug_setup)
+	var start_label := Label.new()
+	start_label.text = "Test start"
+	wave_debug_setup.add_child(start_label)
+	debug_wave_picker = OptionButton.new()
+	for data: Dictionary in WaveSchedule.CONFIG:
+		debug_wave_picker.add_item("Wave %d" % data.number)
+	wave_debug_setup.add_child(debug_wave_picker)
+	debug_wave_seed = SpinBox.new()
+	debug_wave_seed.min_value = 0
+	debug_wave_seed.max_value = 2147483647
+	debug_wave_seed.value = wave_seed
+	debug_wave_seed.prefix = "Seed "
+	wave_debug_setup.add_child(debug_wave_seed)
+	action(wave_debug_setup, "Wave config", debug_view_wave_config)
+
+	wave_debug_live = HBoxContainer.new()
+	wave_debug_live.alignment = BoxContainer.ALIGNMENT_CENTER
+	rows.add_child(wave_debug_live)
+	debug_enemy_picker = OptionButton.new()
+	for title: String in ENEMY_TYPES:
+		debug_enemy_picker.add_item(title)
+	wave_debug_live.add_child(debug_enemy_picker)
+	action(wave_debug_live, "Spawn enemy", debug_spawn_enemy)
+	action(wave_debug_live, "Pending spawns", debug_view_schedule)
+	action(wave_debug_live, "Lane assignments", debug_view_lanes)
+
+
+func wave_debug_ready() -> bool:
+	return wave_debug_enabled and pending_owner == null and (phase == Phase.PLAYER or phase == Phase.ENEMY)
+
+
+func debug_view_wave_config() -> void:
+	if not wave_debug_enabled or phase != Phase.SETUP:
+		return
+	var lines: Array[String] = []
+	for data: Dictionary in WaveSchedule.CONFIG:
+		var rounds := wave_round_override if wave_round_override > 0 else int(data.rounds)
+		lines.append("Wave %d · %d rounds · %d ordinary · Weights %s%s" % [
+			data.number, rounds, waves.ordinary_count(data.number, player_count.selected + 1),
+			str(data.weights), " · Boss +1" if data.boss else "",
+		])
+	show_wave_debug("Grunt / Runner / Brute weights\n\n" + "\n".join(lines))
+
+
+func debug_view_schedule() -> void:
+	if not wave_debug_ready():
+		return
+	var batches: Dictionary = {}
+	for entry in waves.pending:
+		var key := "Wave %d, Enemy Turn %d" % [entry.wave, entry.due_turn]
+		if not batches.has(key):
+			batches[key] = []
+		batches[key].append(entry.kind)
+	var lines: Array[String] = []
+	for key: String in batches:
+		lines.append("%s · %s" % [key, ", ".join(batches[key])])
+	show_wave_debug("\n".join(lines) if not lines.is_empty() else "No pending spawns.")
+
+
+func debug_view_lanes() -> void:
+	if not wave_debug_ready():
+		return
+	var lines: Array[String] = []
+	for lane in range(LANE_NAMES.size()):
+		var assigned: Array[String] = []
+		for enemy in enemies:
+			if enemy.spawn_lane == lane:
+				assigned.append(enemy.title)
+		if not assigned.is_empty():
+			lines.append("%s · %s" % [LANE_NAMES[lane], ", ".join(assigned)])
+	show_wave_debug("\n".join(lines) if not lines.is_empty() else "No active lane assignments.")
+
+
+func debug_spawn_enemy() -> void:
+	if not wave_debug_ready():
+		return
+	var title := debug_enemy_picker.get_item_text(debug_enemy_picker.selected)
+	var lane := spawn_enemy(title)
+	if lane < 0:
+		refresh("Boss is limited to Wave 5 and one spawn. All enemies require a valid lane." if title == WaveSchedule.BOSS_TYPE else "No valid lane.")
+		return
+	if title == WaveSchedule.BOSS_TYPE:
+		for entry in waves.pending:
+			if entry.kind == WaveSchedule.BOSS_TYPE:
+				waves.pending.erase(entry)
+				break
+	refresh("%s spawned on lane %s for testing." % [title, LANE_NAMES[lane]])
+
+
+func show_wave_debug(message: String) -> void:
+	card_notice.title = "Wave debug"
+	card_notice.dialog_text = message
+	if DisplayServer.get_name() != "headless":
+		card_notice.popup_centered(Vector2i(640, 0))
+
+
 func refresh(message: String) -> void:
 	var health_readout: Array[String] = ["Fortress %d/%d HP" % [integrity, MAX_INTEGRITY]]
 	for index in range(heroes.size()):
@@ -1523,14 +1642,12 @@ func refresh(message: String) -> void:
 		markers[heroes[active_player].location].material_override = endpoint_material
 	layout_enemies()
 	update_placement()
-	dice_status.text = dice_result
+	var rolls: Array[String] = []
 	if not fork_rolls.is_empty():
-		dice_status.text = "Fork rolls   " + "  ·  ".join(fork_rolls)
-	elif wave_waiting and not wave_plan.is_empty() and (phase == Phase.ENEMY or dice_result.is_empty()):
-		var incoming: Array = wave_plan[wave]
-		dice_status.text = "Incoming (%d)   " % incoming.size() + "  ·  ".join(incoming)
-
-
+		rolls.append("Fork rolls   " + "  ·  ".join(fork_rolls))
+	if not dice_result.is_empty():
+		rolls.append(dice_result)
+	dice_status.text = "\n".join(rolls)
 
 	var in_game := phase != Phase.TITLE and phase != Phase.SETUP
 	setup_controls.visible = phase == Phase.SETUP
@@ -1539,7 +1656,19 @@ func refresh(message: String) -> void:
 	fortress_health.visible = in_game
 	fortress_health.text = "■".repeat(integrity) + "□".repeat(MAX_INTEGRITY - integrity)
 	fortress_health.modulate = Color("#9df4b7") if integrity > 2 else Color("#ff826d")
-	dice_status.visible = in_game
+	dice_status.visible = in_game and not dice_status.text.is_empty()
+	wave_status.visible = in_game
+	if in_game:
+		var countdown := "Next wave in %d rounds" % waves.rounds_until_next_wave()
+		if waves.current_wave == WaveSchedule.CONFIG.size():
+			countdown = "Final wave"
+		wave_status.text = "Wave %d/%d · Wave round %d · %s · Active %d · Scheduled this wave %d · Enemy Turns %d" % [
+			waves.current_wave, WaveSchedule.CONFIG.size(), waves.wave_round, countdown, enemies.size(),
+			waves.remaining_spawns(waves.current_wave), waves.completed_turns,
+		]
+	if wave_debug_enabled:
+		wave_debug_setup.visible = phase == Phase.SETUP
+		wave_debug_live.visible = (phase == Phase.PLAYER or phase == Phase.ENEMY) and pending_owner == null
 	tile_card.visible = phase == Phase.PLAYER and drawn_tile >= 0
 	reveal_button.visible = phase == Phase.PLAYER
 	reveal_button.text = "Cancel reveal" if tile_card.visible else "Reveal tile"
@@ -1609,10 +1738,10 @@ func refresh(message: String) -> void:
 				instructions.text = "%s   ·   %s   ·   %s" % [move_status, attack_status, reveal_status]
 		Phase.ENEMY:
 			phase_button.text = "Enemy Turn"
-			if wave_waiting:
-				instructions.text = "Roll starting lanes for the incoming enemies."
-			else:
-				instructions.text = "Resolve enemy movement, attacks, and breaches."
+			instructions.text = "Existing monsters act first. Scheduled monsters enter afterward."
+		Phase.ROUND_START:
+			phase_button.text = "Continue round"
+			instructions.text = "All heroes are incapacitated. Continue to the next Enemy Turn."
 		Phase.COMPLETE:
 			instructions.text = "Choose Restart to start a new game."
 
@@ -1623,9 +1752,11 @@ func refresh(message: String) -> void:
 				phase_title = "Player %d’s turn · %s" % [active_player + 1, heroes[active_player].title]
 			Phase.ENEMY:
 				phase_title = "Enemy phase"
+			Phase.ROUND_START:
+				phase_title = "All heroes down"
 			Phase.COMPLETE:
 				phase_title = "Defeat" if integrity == 0 else "Victory"
-		status.text = "Round %d   ·   Wave %d/%d   ·   %s%s" % [
-			round_number, wave + 1, wave_plan.size(), phase_title,
+		status.text = "Round %d   ·   %s%s" % [
+			round_number, phase_title,
 			"   ·   " + message if not message.is_empty() else "",
 		]

@@ -44,14 +44,16 @@ func run() -> void:
 			board.advance_phase()
 		assert(board.phase_button.text == "Enemy Turn")
 		board.advance_phase()
-		assert(board.round_number == 2 and board.wave == 0 and not board.wave_waiting)
+		assert(board.round_number == 2 and board.waves.current_wave == 1 and board.waves.completed_turns == 1)
 		assert(board.active_player == 0 and board.phase == Tabletop.Phase.PLAYER)
-		assert(board.enemies.size() == (2 if count == 1 else 3))
+		assert(board.enemies.size() == (1 if count <= 2 else 2))
 		board.free()
 
 	var battle := make_board(1)
 	end_player_turns(battle)
 	battle.advance_phase()
+	battle.waves.pending.clear()
+	battle.spawn_enemy("Grunt")
 	var hero := battle.heroes[0]
 	var west: int = battle.network.links[0][3]
 	battle.move_hero(west + 1)
@@ -62,6 +64,8 @@ func run() -> void:
 	set_location(follower, west + 2)
 	runner.stride = 3
 	runner.title = "Runner"
+	runner.health = 1
+	runner.attack_damage = 1
 	follower.attack_damage = 2
 	end_player_turns(battle)
 	battle.advance_phase()
@@ -82,26 +86,27 @@ func run() -> void:
 	battle.advance_phase()
 	assert(hero.health == 0 and hero.piece.visible and hero.figure.rotation.z > 1.0)
 	assert("incapacitated" in battle.status.text and "Down" in hero.health_label.text)
-	assert(battle.hero_at(hero.location) == null and battle.phase == Tabletop.Phase.ENEMY)
+	assert(battle.hero_at(hero.location) == null and battle.phase == Tabletop.Phase.ROUND_START)
 	assert(battle.legal_moves.is_empty() and battle.attack_targets.is_empty() and not battle.can_reveal())
 	assert(follower.location == west + 2)
 	follower.stride = 4
 	var previous_round := battle.round_number
 	battle.advance_phase()
+	battle.advance_phase()
 	assert(follower not in battle.enemies and battle.integrity == 4)
-	assert(battle.round_number == previous_round + 1 and battle.wave == 1 and battle.wave_waiting)
+	assert(battle.round_number == previous_round + 1 and battle.waves.current_wave == 2 and battle.waves.completed_turns == 4)
 	battle.free()
 
 	var defense := make_board(1)
 	end_player_turns(defense)
 	defense.advance_phase()
 	var breach := defense.enemies[0]
-	defense.remove_enemy(defense.enemies[1])
+	defense.waves.pending.clear()
 	set_location(breach, defense.network.links[0][0])
 	end_player_turns(defense)
 	defense.advance_phase()
 	assert(defense.warden_defended and defense.integrity == 5 and breach not in defense.enemies)
-	assert(defense.wave == 1 and defense.wave_waiting)
+	assert(defense.waves.current_wave == 1 and defense.waves.completed_turns == 2)
 	defense.free()
 	assert(Tabletop.ENEMY_TYPES["Brute"].attack_damage == 2)
 	assert(Tabletop.ENEMY_TYPES["Brute"].breach_damage == 2)
@@ -119,8 +124,8 @@ func run() -> void:
 
 	var finale := make_board(1)
 	end_player_turns(finale)
-	finale.wave = finale.wave_plan.size() - 1
-	finale.wave_plan = [[], [], ["Boss"]]
+	finale.waves.reset(1, 10, 5)
+	finale.waves.pending.assign(finale.waves.pending.filter(func(entry): return entry.kind == "Boss"))
 	finale.advance_phase()
 	assert(finale.enemies.size() == 1)
 	var boss := finale.enemies[0]
@@ -129,10 +134,12 @@ func run() -> void:
 	finale.advance_phase()
 	finale.advance_phase()
 	assert(finale.integrity == 3 and finale.enemies.has(boss) and boss.health == 3)
-	assert(finale.phase == Tabletop.Phase.ENEMY and finale.wave == 2)
+	assert(finale.phase == Tabletop.Phase.ROUND_START and finale.waves.current_wave == 5)
 	assert("remains at the fortress approach" in finale.status.text)
 	finale.advance_phase()
-	assert(finale.integrity == 1 and finale.phase == Tabletop.Phase.ENEMY)
+	finale.advance_phase()
+	assert(finale.integrity == 1 and finale.phase == Tabletop.Phase.ROUND_START)
+	finale.advance_phase()
 	finale.advance_phase()
 	assert(finale.integrity == 0 and finale.phase == Tabletop.Phase.COMPLETE)
 	finale.free()
