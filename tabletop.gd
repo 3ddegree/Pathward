@@ -14,8 +14,8 @@ const MAX_PLAYERS := 5
 const ENEMY_TYPES := {
 	"Grunt": {"stride": 1, "breach_damage": 1, "attack_damage": 1, "health": 1, "color": Color("#ff865e")},
 	"Runner": {"stride": 2, "breach_damage": 1, "attack_damage": 1, "health": 1, "color": Color("#f4ce63")},
-	"Brute": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 2, "color": Color("#f46ea5")},
-	"Boss": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 3, "color": Color("#be8cff"), "remove_on_breach": true},
+	"Brute": {"stride": 1, "breach_damage": 2, "attack_damage": 2, "health": 2, "color": Color("#f46ea5")},
+	"Boss": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 3, "color": Color("#be8cff"), "remove_on_breach": false},
 }
 const WAVE_PLANS := [
 	[
@@ -32,6 +32,9 @@ const WAVE_PLANS := [
 ]
 
 enum Phase { TITLE, SETUP, PLAYER, ENEMY, COMPLETE }
+enum FrontlineOrder { FIRST_PLAYER, LAST_PLAYER }
+
+@export var frontline_order: FrontlineOrder = FrontlineOrder.FIRST_PLAYER
 
 class Hero:
 	var id: StringName
@@ -781,11 +784,17 @@ func enemy_at(location: int) -> Enemy:
 
 
 func hero_at(location: int) -> Hero:
-	if location != FORTRESS:
-		for hero in heroes:
-			if hero.health > 0 and hero.location == location:
-				return hero
-	return null
+	# The fortress uses the breach rules, including the Warden's passive.
+	if location == FORTRESS:
+		return null
+	var frontline: Hero
+	for hero in heroes:
+		if hero.health <= 0 or hero.location != location:
+			continue
+		frontline = hero
+		if frontline_order == FrontlineOrder.FIRST_PLAYER:
+			break
+	return frontline
 
 
 func find_attack_targets() -> Array[Enemy]:
@@ -1001,6 +1010,8 @@ func resolve_enemies() -> void:
 					damage += lost_hp
 				if enemy.remove_on_breach:
 					remove_enemy(enemy)
+				else:
+					report.append("%s remains at the fortress approach." % enemy.title)
 				break
 			var heading := network.positions[destination] - network.positions[enemy.location]
 			enemy.piece.rotation.y = atan2(heading.x, heading.z)

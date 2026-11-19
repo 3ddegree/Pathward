@@ -103,5 +103,38 @@ func run() -> void:
 	assert(defense.warden_defended and defense.integrity == 5 and breach not in defense.enemies)
 	assert(defense.wave == 1 and defense.wave_waiting)
 	defense.free()
+	assert(Tabletop.ENEMY_TYPES["Brute"].attack_damage == 2)
+	assert(Tabletop.ENEMY_TYPES["Brute"].breach_damage == 2)
+
+	var frontline := make_board(2)
+	var road: int = frontline.network.links[0][0]
+	frontline.heroes[0].location = road
+	frontline.heroes[1].location = road
+	assert(frontline.hero_at(road) == frontline.heroes[0])
+	frontline.frontline_order = Tabletop.FrontlineOrder.LAST_PLAYER
+	assert(frontline.hero_at(road) == frontline.heroes[1])
+	frontline.heroes[1].health = 0
+	assert(frontline.hero_at(road) == frontline.heroes[0])
+	frontline.free()
+
+	var finale := make_board(1)
+	end_player_turns(finale)
+	finale.wave = finale.wave_plan.size() - 1
+	finale.wave_plan = [[], [], ["Boss"]]
+	finale.advance_phase()
+	assert(finale.enemies.size() == 1)
+	var boss := finale.enemies[0]
+	set_location(boss, finale.network.links[0][0])
+	finale.heroes[0].health = 0
+	finale.advance_phase()
+	finale.advance_phase()
+	assert(finale.integrity == 3 and finale.enemies.has(boss) and boss.health == 3)
+	assert(finale.phase == Tabletop.Phase.ENEMY and finale.wave == 2)
+	assert("remains at the fortress approach" in finale.status.text)
+	finale.advance_phase()
+	assert(finale.integrity == 1 and finale.phase == Tabletop.Phase.ENEMY)
+	finale.advance_phase()
+	assert(finale.integrity == 0 and finale.phase == Tabletop.Phase.COMPLETE)
+	finale.free()
 	print("ENEMY_TURN_OK")
 	quit()
