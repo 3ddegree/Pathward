@@ -8,6 +8,7 @@ const MAX_INTEGRITY := 5
 const FORTRESS := 0
 const START_VIEW := Vector3(0.38, 0.87, 23.0)
 const HeroCatalog := preload("res://hero_catalog.gd")
+const HeroTurn := preload("res://hero_turn.gd")
 const MAX_PLAYERS := 5
 const ENEMY_TYPES := {
 	"Grunt": {"stride": 1, "damage": 1, "health": 1, "color": Color("#ff865e")},
@@ -35,12 +36,10 @@ class Hero:
 	var id: StringName
 	var attack_damage: int
 	var title: String
-	var stride: int
+	var budget: HeroTurn
 	var max_health: int
 	var health: int
 	var location: int
-	var moved := false
-	var attacked := false
 	var attack_range: int
 	var piece: Node3D
 	var health_label: Label3D
@@ -61,7 +60,7 @@ class Enemy:
 var network := RoadNetwork.new()
 var markers: Array[MeshInstance3D] = []
 var enemies: Array[Enemy] = []
-var legal_moves: Array[int] = []
+var legal_moves: Dictionary[int, int] = {}
 var attack_targets: Array[Enemy] = []
 var aiming := false
 var reveal_markers: Dictionary = {}
@@ -85,6 +84,7 @@ var fortress_health: Label3D
 var camera: Camera3D
 var orbit := START_VIEW
 var health_status: Label
+var turn_status: Label
 var dice_status: Label
 var tile_card: PanelContainer
 var drawn_tile_label: Label
@@ -227,7 +227,7 @@ func build_heroes() -> void:
 		var hero := Hero.new()
 		hero.id = entry["id"]
 		hero.title = entry["name"]
-		hero.stride = entry["current_movement"]
+		hero.budget = HeroTurn.new(entry["movement"], entry["starting_energy"], entry["max_energy"])
 		hero.attack_damage = entry["attack_damage"]
 		hero.attack_range = entry["attack_range"]
 		hero.max_health = entry["health"]
@@ -323,6 +323,7 @@ func build_controls() -> void:
 	action(controls, "Restart", restart)
 
 	health_status = centered_label(rows)
+	turn_status = centered_label(rows)
 	dice_status = centered_label(rows)
 	status = centered_label(rows)
 	instructions = centered_label(rows)
@@ -464,6 +465,8 @@ func advance_phase() -> void:
 
 
 func begin_player_turn(index: int, message: String) -> void:
+	if phase == Phase.PLAYER:
+		heroes[active_player].budget.end_turn()
 	aiming = false
 	drawn_tile = -1
 	placement_target = Vector2i.ZERO
@@ -471,14 +474,13 @@ func begin_player_turn(index: int, message: String) -> void:
 		index += 1
 	active_player = index
 	phase = Phase.PLAYER if index < heroes.size() else Phase.ENEMY
+	if phase == Phase.PLAYER:
+		heroes[active_player].budget.begin_turn()
 	refresh(message)
 
 
 func begin_next_round(message: String) -> void:
 	round_number += 1
-	for hero in heroes:
-		hero.moved = false
-		hero.attacked = false
 	begin_tile_reveal(message)
 
 
@@ -650,27 +652,27 @@ func _unhandled_input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 
 
-func find_moves() -> Array[int]:
-	var result: Array[int] = []
+func find_moves() -> Dictionary[int, int]:
+	var destinations: Dictionary[int, int] = {}
 	if phase != Phase.PLAYER:
-		return result
+		return destinations
 	var hero := heroes[active_player]
-	if hero.moved or hero.health == 0:
-		return result
+	if hero.health == 0:
+		return destinations
 	var frontier: Array[int] = [hero.location]
-	var seen := {hero.location: true}
-	for _step in range(hero.stride):
+	for distance in range(1, hero.budget.movement_left + 1):
 		var next_frontier: Array[int] = []
 		for node in frontier:
 			for next: int in network.links[node]:
-				if seen.has(next) or hero_at(next) != null:
+				if next == hero.location or destinations.has(next) or hero_at(next) != null:
 					continue
-				seen[next] = true
-				result.append(next)
+				destinations[next] = distance
 				if next != FORTRESS and enemy_at(next) == null:
 					next_frontier.append(next)
 		frontier = next_frontier
-	return result
+		if frontier.is_empty():
+			break
+	return destinations
 
 
 func enemy_at(location: int) -> Enemy:
@@ -693,7 +695,7 @@ func find_attack_targets() -> Array[Enemy]:
 	if phase != Phase.PLAYER:
 		return targets
 	var hero := heroes[active_player]
-	if hero.health == 0 or hero.attacked:
+	if hero.health == 0 or hero.budget.actions_left == 0:
 		return targets
 	var frontier: Array[int] = [hero.location]
 	var reachable := {hero.location: true}
@@ -718,6 +720,8 @@ func toggle_attack() -> void:
 
 
 func click_attack_target(click: Vector2) -> void:
+	if phase != Phase.PLAYER or not aiming:
+		return
 	var nearest: Enemy
 	var distance_limit := 21.0
 	for enemy in enemies:
@@ -728,7 +732,8 @@ func click_attack_target(click: Vector2) -> void:
 			distance_limit = distance
 	if nearest in attack_targets:
 		var hero := heroes[active_player]
-		hero.attacked = true
+		if not hero.budget.spend_action():
+			return
 		aiming = false
 		nearest.health = maxi(0, nearest.health - hero.attack_damage)
 		if nearest.health == 0:
@@ -748,10 +753,13 @@ func monster_attack(hero: Hero, enemy: Enemy) -> String:
 
 
 func move_hero(destination: int) -> void:
+	if phase != Phase.PLAYER or aiming or not legal_moves.has(destination):
+		return
 	var hero := heroes[active_player]
-	hero.location = destination
-	hero.moved = true
-	refresh("%s moved." % hero.title)
+	var cost: int = legal_moves[destination]
+	if hero.budget.spend_movement(cost):
+		hero.location = destination
+		refresh("%s moved %d %s." % [hero.title, cost, "space" if cost == 1 else "spaces"])
 
 
 func roll_wave() -> void:
@@ -910,6 +918,7 @@ func refresh(message: String) -> void:
 	var in_game := phase != Phase.TITLE and phase != Phase.SETUP
 	setup_controls.visible = phase == Phase.SETUP
 	health_status.visible = in_game
+	turn_status.visible = phase == Phase.PLAYER
 	fortress_health.visible = in_game
 	fortress_health.text = "■".repeat(integrity) + "□".repeat(MAX_INTEGRITY - integrity)
 	fortress_health.modulate = Color("#9df4b7") if integrity > 2 else Color("#ff826d")
@@ -945,16 +954,27 @@ func refresh(message: String) -> void:
 				instructions.text = "Place the tile, or choose another gold space." if rotate_button.disabled else "Rotate, place, or choose another gold space."
 		Phase.PLAYER:
 			var player := heroes[active_player]
+			var budget := player.budget
+			turn_status.text = "Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Attack %d damage, range %d" % [
+				budget.movement_left, budget.max_movement, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
+				budget.energy, budget.max_energy, player.attack_damage, player.attack_range,
+			]
 			phase_button.text = "End Player %d’s turn" % (active_player + 1)
 			if player.health == 0:
 				instructions.text = "Your hero was defeated. End your turn to continue."
 			elif aiming:
 				instructions.text = "Click an orange-marked monster to attack."
 			else:
-				var move_status := "Move used" if player.moved else "Click a glowing space to move"
-				var attack_status := "Attack used" if player.attacked else "No monsters in range"
-				if not attack_targets.is_empty():
-					attack_status = "Attack available (%d-space range)" % player.attack_range
+				var move_status := "Click a glowing space to move"
+				if budget.movement_left == 0:
+					move_status = "No movement points left"
+				elif legal_moves.is_empty():
+					move_status = "No reachable spaces"
+				var attack_status := "Attack available"
+				if budget.actions_left == 0:
+					attack_status = "No actions left"
+				elif attack_targets.is_empty():
+					attack_status = "No monsters in range"
 				instructions.text = "%s   ·   %s" % [move_status, attack_status]
 		Phase.ENEMY:
 			if wave_waiting:
