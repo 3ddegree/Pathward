@@ -1,5 +1,6 @@
 extends Node3D
 
+const TabletopDock := preload("res://tabletop_dock.gd")
 const DicePanel := preload("res://spawn_dice_panel.gd")
 const PartyPanel := preload("res://party_panel.gd")
 const WaveSchedule := preload("res://wave_schedule.gd")
@@ -11,7 +12,7 @@ const TILE_PORTS := [[0, 2], [0, 1], [0, 1, 3], [0, 1, 2, 3]]
 const TILE_NAMES := ["Straight", "Curve", "T-junction", "Four-way crossing"]
 const MAX_INTEGRITY := 5
 const FORTRESS := 0
-const START_VIEW := Vector3(0.38, 0.87, 23.0)
+const START_VIEW := Vector3(0.38, 0.87, 19.0)
 const HeroCatalog := preload("res://hero_catalog.gd")
 const HeroTurn := preload("res://hero_turn.gd")
 const MAX_PLAYERS := 5
@@ -122,8 +123,8 @@ var enemy_report: Array[String] = []
 var spawn_history: Array[String] = []
 var last_spawn_result := ""
 var wave_debug_enabled := OS.is_debug_build() and "--pathward-wave-debug" in OS.get_cmdline_user_args()
-var wave_debug_setup: HBoxContainer
-var wave_debug_live: HBoxContainer
+var wave_debug_setup: HFlowContainer
+var wave_debug_live: HFlowContainer
 var debug_wave_picker: OptionButton
 var debug_wave_seed: SpinBox
 var debug_enemy_picker: OptionButton
@@ -146,6 +147,13 @@ var tile_diagram: Control
 var rotate_button: Button
 var place_button: Button
 var phase_button: Button
+var player_dock: TabletopDock
+var wave_dock: TabletopDock
+var lobby: PanelContainer
+var lobby_actions: VBoxContainer
+var lobby_messages: VBoxContainer
+var player_messages: VBoxContainer
+var wave_messages: VBoxContainer
 var attack_button: Button
 var attack_material: StandardMaterial3D
 var setup_controls: VBoxContainer
@@ -378,74 +386,92 @@ func add_lane_label(lane: int, cell: Vector2i) -> void:
 func build_controls() -> void:
 	var overlay := CanvasLayer.new()
 	add_child(overlay)
-	var heading := Label.new()
-	heading.position = Vector2(22, 14)
+
+	lobby = PanelContainer.new()
+	overlay.add_child(lobby)
+	lobby.set_anchors_and_offsets_preset(Control.PRESET_CENTER_TOP)
+	lobby.offset_left = -320
+	lobby.offset_right = 320
+	lobby.offset_top = 28
+	var setup_rows := VBoxContainer.new()
+	setup_rows.add_theme_constant_override("separation", 10)
+	lobby.add_child(setup_rows)
+	var heading := centered_label(setup_rows)
 	heading.text = "Pathward: Roads to Ruin"
 	heading.add_theme_font_size_override("font_size", 29)
-	overlay.add_child(heading)
-	var camera_hint := Label.new()
-	camera_hint.position = Vector2(23, 51)
-	camera_hint.text = "Right-drag to orbit  ·  Scroll to zoom"
-	overlay.add_child(camera_hint)
+	lobby_messages = VBoxContainer.new()
+	setup_rows.add_child(lobby_messages)
+	status = centered_label(lobby_messages)
+	instructions = centered_label(lobby_messages)
+	build_setup_controls(setup_rows)
+	lobby_actions = VBoxContainer.new()
+	setup_rows.add_child(lobby_actions)
+	phase_button = action(lobby_actions, "Start game", advance_phase)
+	phase_button.custom_minimum_size.y = 40
 
-	var panel := PanelContainer.new()
-	overlay.add_child(panel)
-	panel.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
-	panel.offset_left = 16
-	panel.offset_right = -16
-	panel.offset_top = -130
-	panel.grow_vertical = Control.GROW_DIRECTION_BEGIN
-	panel.offset_bottom = -14
-	var rows := VBoxContainer.new()
-	rows.alignment = BoxContainer.ALIGNMENT_CENTER
-	panel.add_child(rows)
-	var controls := HBoxContainer.new()
-	controls.alignment = BoxContainer.ALIGNMENT_CENTER
-	rows.add_child(controls)
-	place_button = action(controls, "Place tile", place_tile)
-	rotate_button = action(controls, "Rotate", rotate_tile)
-	reveal_button = action(controls, "Reveal tile", toggle_reveal)
-	attack_button = action(controls, "Attack", toggle_attack)
-	phase_button = action(controls, "Start game", advance_phase)
-	action(controls, "Reset view", reset_view)
-	action(controls, "Restart", restart)
+	player_dock = TabletopDock.new()
+	overlay.add_child(player_dock)
+	player_dock.configure("Party", false, true)
+	var left := player_dock.body
+	active_hero_heading = sidebar_label(left)
+	active_hero_heading.add_theme_font_size_override("font_size", 20)
+	active_hero_heading.modulate = Color("#a9efd3")
+	turn_status = sidebar_label(left)
+	turn_status.add_theme_font_size_override("font_size", 14)
+	party_panel = PartyPanel.new()
+	left.add_child(party_panel)
+	var hero_actions := HFlowContainer.new()
+	left.add_child(hero_actions)
+	reveal_button = action(hero_actions, "Reveal tile", toggle_reveal)
+	attack_button = action(hero_actions, "Attack", toggle_attack)
+	player_messages = VBoxContainer.new()
+	left.add_child(player_messages)
 
-	health_status = centered_label(rows)
-	turn_status = centered_label(rows)
-	dice_status = centered_label(rows)
-	wave_status = centered_label(rows)
-	status = centered_label(rows)
-	active_hero_heading = centered_label(rows)
-	active_hero_heading.add_theme_font_size_override("font_size", 24)
-	build_spawn_controls(rows, overlay)
-	instructions = centered_label(rows)
-
-	build_setup_controls(rows)
-	build_card_controls(rows, overlay)
+	wave_dock = TabletopDock.new()
+	overlay.add_child(wave_dock)
+	wave_dock.configure("Waves & dice", true, false)
+	var right := wave_dock.body
+	health_status = sidebar_label(right)
+	health_status.add_theme_font_size_override("font_size", 18)
+	wave_status = sidebar_label(right)
+	build_tile_card(right)
+	wave_messages = VBoxContainer.new()
+	right.add_child(wave_messages)
+	build_spawn_controls(right)
+	dice_status = sidebar_label(right)
+	build_card_controls(left, right, overlay)
 	if wave_debug_enabled:
-		build_wave_debug(rows)
+		build_wave_debug(setup_rows, right)
+	var session_controls := HFlowContainer.new()
+	right.add_child(session_controls)
+	var reset_button := action(session_controls, "Reset view", reset_view)
+	reset_button.tooltip_text = "Right-drag the board to orbit. Scroll over the board to zoom."
+	action(session_controls, "Restart", restart)
 
+
+func build_tile_card(parent: VBoxContainer) -> void:
 	tile_card = PanelContainer.new()
-	tile_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	overlay.add_child(tile_card)
-	tile_card.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
-	tile_card.offset_left = -166
-	tile_card.offset_right = -16
-	tile_card.offset_top = 82
-	tile_card.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	var card_content := VBoxContainer.new()
-	card_content.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	tile_card.add_child(card_content)
-	drawn_tile_label = centered_label(card_content)
-	drawn_tile_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	terrain_description = centered_label(card_content)
-	terrain_description.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(tile_card)
+	var content := VBoxContainer.new()
+	tile_card.add_child(content)
+	drawn_tile_label = centered_label(content)
+	terrain_description = sidebar_label(content)
 	tile_diagram = Control.new()
-	tile_diagram.custom_minimum_size = Vector2(108, 108)
+	tile_diagram.custom_minimum_size = Vector2(84, 84)
 	tile_diagram.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	tile_diagram.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	tile_diagram.draw.connect(draw_tile_diagram)
-	card_content.add_child(tile_diagram)
+	content.add_child(tile_diagram)
+	var controls := HFlowContainer.new()
+	content.add_child(controls)
+	place_button = action(controls, "Place tile", place_tile)
+	rotate_button = action(controls, "Rotate", rotate_tile)
+
+
+func sidebar_label(parent: BoxContainer) -> Label:
+	var label := centered_label(parent)
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	return label
 
 
 func build_setup_controls(parent: VBoxContainer) -> void:
@@ -946,18 +972,14 @@ func move_hero(destination: int) -> void:
 		refresh("%s moved %d %s." % [hero.title, cost, "space" if cost == 1 else "spaces"])
 
 
-func build_spawn_controls(rows: VBoxContainer, overlay: CanvasLayer) -> void:
+func build_spawn_controls(rows: VBoxContainer) -> void:
 	spawn_dice = DicePanel.new()
 	rows.add_child(spawn_dice)
 	spawn_dice.rolled.connect(roll_spawn_die)
-	var tools_row := HBoxContainer.new()
-	tools_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	var tools_row := HFlowContainer.new()
 	rows.add_child(tools_row)
 	dice_reference_button = action(tools_row, "Dice faces", show_spawn_faces)
 	spawn_history_button = action(tools_row, "Spawn history", show_spawn_history)
-	party_panel = PartyPanel.new()
-	party_panel.position = Vector2(16, 76)
-	overlay.add_child(party_panel)
 
 
 func valid_spawn_lanes() -> Array[int]:
@@ -1352,8 +1374,8 @@ func resolve_immediate_card(hero: Hero, card: Dictionary) -> String:
 	return "No effect applied."
 
 
-func build_card_controls(rows: VBoxContainer, overlay: CanvasLayer) -> void:
-	card_counts = centered_label(rows)
+func build_card_controls(rows: VBoxContainer, counts_parent: VBoxContainer, overlay: CanvasLayer) -> void:
+	card_counts = sidebar_label(counts_parent)
 	hand_controls = HFlowContainer.new()
 	hand_controls.alignment = FlowContainer.ALIGNMENT_CENTER
 	rows.add_child(hand_controls)
@@ -1361,7 +1383,7 @@ func build_card_controls(rows: VBoxContainer, overlay: CanvasLayer) -> void:
 		hand_buttons.append(action(hand_controls, "", choose_hand_card.bind(index)))
 	card_play = action(hand_controls, "Play card", play_selected_card)
 	card_cancel = action(hand_controls, "Cancel", cancel_card)
-	card_details = centered_label(rows)
+	card_details = sidebar_label(rows)
 	card_notice = AcceptDialog.new()
 	card_notice.title = "Exploration card"
 	overlay.add_child(card_notice)
@@ -1516,8 +1538,7 @@ func play_selected_card() -> void:
 func build_card_debug(rows: VBoxContainer) -> void:
 	debug_controls = VBoxContainer.new()
 	rows.add_child(debug_controls)
-	var tools_row := HBoxContainer.new()
-	tools_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	var tools_row := HFlowContainer.new()
 	debug_controls.add_child(tools_row)
 	debug_card_picker = OptionButton.new()
 	for id: StringName in ExplorationDeck.DEFINITIONS:
@@ -1529,8 +1550,7 @@ func build_card_debug(rows: VBoxContainer) -> void:
 	action(tools_row, "Draw random", debug_draw.bind(false))
 	action(tools_row, "Draw selected", debug_draw.bind(true))
 	action(tools_row, "View piles", debug_view_piles)
-	var hand_row := HBoxContainer.new()
-	hand_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	var hand_row := HFlowContainer.new()
 	debug_controls.add_child(hand_row)
 	debug_hero_picker = OptionButton.new()
 	hand_row.add_child(debug_hero_picker)
@@ -1598,7 +1618,7 @@ func refresh_card_controls() -> void:
 			debug_hero_picker.clear()
 			for hero in heroes:
 				debug_hero_picker.add_item(hero.title)
-	card_counts.visible = phase == Phase.PLAYER or phase == Phase.ENEMY
+	card_counts.visible = phase != Phase.TITLE and phase != Phase.SETUP
 	card_counts.text = "Deck %d   ·   Discard %d" % [cards.deck.size(), cards.discard.size()]
 	if shield_hp > 0:
 		card_counts.text += "   ·   Fortress protection %d" % shield_hp
@@ -1629,10 +1649,9 @@ func refresh_card_controls() -> void:
 		card_details.text = "Hand full. Discard one existing card or the new card."
 
 
-func build_wave_debug(rows: VBoxContainer) -> void:
-	wave_debug_setup = HBoxContainer.new()
-	wave_debug_setup.alignment = BoxContainer.ALIGNMENT_CENTER
-	rows.add_child(wave_debug_setup)
+func build_wave_debug(setup_rows: VBoxContainer, live_rows: VBoxContainer) -> void:
+	wave_debug_setup = HFlowContainer.new()
+	setup_rows.add_child(wave_debug_setup)
 	var start_label := Label.new()
 	start_label.text = "Test start"
 	wave_debug_setup.add_child(start_label)
@@ -1660,9 +1679,8 @@ func build_wave_debug(rows: VBoxContainer) -> void:
 	action(wave_debug_setup, "Test die", debug_test_dice)
 	action(wave_debug_setup, "Simulate 100", debug_simulate_dice)
 
-	wave_debug_live = HBoxContainer.new()
-	wave_debug_live.alignment = BoxContainer.ALIGNMENT_CENTER
-	rows.add_child(wave_debug_live)
+	wave_debug_live = HFlowContainer.new()
+	live_rows.add_child(wave_debug_live)
 	debug_enemy_picker = OptionButton.new()
 	for title: String in ENEMY_TYPES:
 		debug_enemy_picker.add_item(title)
@@ -1779,6 +1797,35 @@ func show_wave_debug(message: String, heading: String = "Wave debug") -> void:
 		card_notice.popup_centered(Vector2i(640, 0))
 
 
+func update_sidebar_layout(in_game: bool) -> void:
+	lobby.visible = not in_game
+	player_dock.visible = in_game
+	wave_dock.visible = in_game
+
+	var actions := lobby_actions
+	var status_parent := lobby_messages
+	var instruction_parent := lobby_messages
+	if in_game:
+		actions = player_dock.pinned if phase == Phase.PLAYER else wave_dock.pinned
+		status_parent = wave_messages
+		instruction_parent = player_messages if phase == Phase.PLAYER else wave_messages
+	if phase_button.get_parent() != actions:
+		phase_button.reparent(actions, false)
+	if status.get_parent() != status_parent:
+		status.reparent(status_parent, false)
+		status.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT if in_game else HORIZONTAL_ALIGNMENT_CENTER
+	if instructions.get_parent() != instruction_parent:
+		instructions.reparent(instruction_parent, false)
+		instructions.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT if in_game else HORIZONTAL_ALIGNMENT_CENTER
+		instructions.add_theme_font_size_override("font_size", 14 if in_game else 16)
+
+	player_dock.pinned.visible = phase == Phase.PLAYER
+	wave_dock.pinned.visible = phase == Phase.ENEMY or phase == Phase.ROUND_START
+	if pending_owner != null and not player_dock.expanded:
+		player_dock.header.set_pressed_no_signal(true)
+		player_dock.set_expanded(true)
+
+
 func refresh(message: String) -> void:
 	var party_readout: Array[String] = []
 	for index in range(heroes.size()):
@@ -1798,9 +1845,10 @@ func refresh(message: String) -> void:
 		hero.health_label.modulate = Color("#ff826d") if incapacitated else Color.WHITE
 		if incapacitated:
 			hero.health_label.text += " · Down"
-		party_readout.append("P%d · %s%s\nHP %d/%d   Move %d   Actions %d   Energy %d/%d" % [
-			index + 1, hero.title, " · Down" if incapacitated else "", hero.health, hero.max_health,
-			hero.budget.movement_left, hero.budget.actions_left, hero.budget.energy, hero.budget.max_energy,
+		var active_marker := "▸ " if phase == Phase.PLAYER and index == active_player else ""
+		party_readout.append("%sP%d %s · HP %d/%d · Energy %d/%d%s" % [
+			active_marker, index + 1, hero.title, hero.health, hero.max_health, hero.budget.energy,
+			hero.budget.max_energy, " · Down" if incapacitated else "",
 		])
 	party_panel.show_party(party_readout, active_player if phase == Phase.PLAYER else -1)
 	health_status.text = "Fortress %d/%d HP" % [integrity, MAX_INTEGRITY]
@@ -1827,6 +1875,7 @@ func refresh(message: String) -> void:
 	dice_status.text = "\n".join(rolls)
 
 	var in_game := phase != Phase.TITLE and phase != Phase.SETUP
+	update_sidebar_layout(in_game)
 	setup_controls.visible = phase == Phase.SETUP
 	health_status.visible = in_game
 	party_panel.visible = in_game
@@ -1852,7 +1901,7 @@ func refresh(message: String) -> void:
 		var due := waves.due_spawns().size()
 		if not waves.legacy_mode:
 			due = waves.due_spawns().filter(func(entry: WaveSchedule.Spawn) -> bool: return entry.event_number > 0).size()
-		wave_status.text = "Wave %d/%d · Wave round %d · %s · Active %d · %s left: %d wave / %d round · Enemy Turns %d" % [
+		wave_status.text = "Wave %d/%d · Wave round %d\n%s\nActive enemies %d\n%s: %d wave · %d round\nEnemy Turns %d" % [
 			waves.current_wave, WaveSchedule.CONFIG.size(), waves.wave_round, countdown, enemies.size(),
 			"Spawns" if waves.legacy_mode else "Dice events", remaining, due, waves.completed_turns,
 		]
@@ -1893,13 +1942,19 @@ func refresh(message: String) -> void:
 			var budget := player.budget
 			active_hero_heading.text = "Player %d — %s" % [active_player + 1, player.title]
 			var definition: Dictionary = HeroCatalog.DEFINITIONS[character_pickers[active_player].selected]
-			turn_status.text = "HP %d/%d   ·   Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Reveals %d/%d   ·   Attack %d damage, range %d" % [
+			turn_status.text = "HP %d/%d · Movement %d/%d\nActions %d/%d · Energy %d/%d\nReveals %d/%d · Attack %d damage, range %d" % [
 				player.health, player.max_health, budget.movement_left, budget.movement_limit, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
 				budget.energy, budget.max_energy, budget.reveals_left, budget.reveal_limit,
 				player.attack_damage, player.attack_range,
 			]
 			turn_status.text += "\n%s · %d Energy (%s)" % [definition.ability_name, definition.ability_energy, "proposed; passive active" if definition.ability_passive else "planned"]
-			phase_button.text = "End Player %d’s turn" % (active_player + 1)
+			if budget.next_movement_penalty > 0:
+				turn_status.text += "\nExhausted next turn: −%d movement" % budget.next_movement_penalty
+			if definition.ability_passive and warden_defended:
+				turn_status.text += "\nLast Stand used this wave"
+			if player.health == 0:
+				turn_status.text += "\nIncapacitated"
+			phase_button.text = "End Turn"
 			if pending_owner != null:
 				instructions.text = "Choose a card to discard before continuing."
 			elif selected_card >= 0:
@@ -1945,11 +2000,11 @@ func refresh(message: String) -> void:
 		var phase_title := ""
 		match phase:
 			Phase.PLAYER:
-				phase_title = "Player %d’s turn · %s" % [active_player + 1, heroes[active_player].title]
+				phase_title = "Player turn"
 			Phase.ENEMY:
 				phase_title = "Enemy phase"
 			Phase.SPAWN_DICE:
-				phase_title = "Enemy Turn · Roll spawning dice"
+				phase_title = "Enemy Turn"
 			Phase.ROUND_START:
 				phase_title = "All heroes down"
 			Phase.COMPLETE:

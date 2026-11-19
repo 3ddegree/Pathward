@@ -1,4 +1,4 @@
-extends HFlowContainer
+extends VBoxContainer
 
 signal rolled(die: int)
 
@@ -9,11 +9,11 @@ var animating := false
 
 
 func _ready() -> void:
-	alignment = FlowContainer.ALIGNMENT_CENTER
+	alignment = BoxContainer.ALIGNMENT_CENTER
 	for die in range(LABELS.size()):
 		var button := Button.new()
 		button.text = LABELS[die]
-		button.custom_minimum_size = Vector2(156, 38)
+		button.custom_minimum_size = Vector2(0, 38)
 		button.pressed.connect(animate_roll.bind(die))
 		add_child(button)
 		buttons.append(button)
@@ -23,8 +23,11 @@ func show_rolls(lane: String, kind: String, quantity: int, next_die: int) -> voi
 	expected = next_die
 	var results := [lane, kind, str(quantity) if quantity > 0 else ""]
 	for die in range(buttons.size()):
-		buttons[die].text = LABELS[die] if results[die].is_empty() else "%s · %s" % [LABELS[die], results[die]]
-		buttons[die].disabled = die != next_die or animating
+		var button := buttons[die]
+		button.text = LABELS[die] if results[die].is_empty() else "%s · %s" % [LABELS[die], results[die]]
+		button.disabled = die != next_die or animating
+		button.add_theme_color_override("font_color", Color("#ffe3a6"))
+		button.add_theme_color_override("font_disabled_color", Color("#778495") if results[die].is_empty() else Color("#d9e7f3"))
 
 
 func animate_roll(die: int) -> void:
