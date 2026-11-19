@@ -7,6 +7,7 @@ const Tabletop := preload("res://tabletop.gd")
 
 func make_board(count: int) -> Tabletop:
 	var board := load("res://tabletop.tscn").instantiate() as Tabletop
+	board.waves.legacy_mode = true
 	root.add_child(board)
 	board.advance_phase()
 	board.player_count.select(count - 1)

@@ -11,6 +11,7 @@ func _initialize() -> void:
 func make_board(count: int, seed_value: int = 466) -> Tabletop:
 	var board := load("res://tabletop.tscn").instantiate() as Tabletop
 	board.wave_seed = seed_value
+	board.waves.legacy_mode = true
 	root.add_child(board)
 	board.advance_phase()
 	board.player_count.select(count - 1)
@@ -28,6 +29,7 @@ func finish_round(board: Tabletop) -> void:
 func run() -> void:
 	for players in range(1, 6):
 		var schedule := Schedule.new()
+		schedule.legacy_mode = true
 		schedule.reset(players, 128)
 		for number in range(1, 6):
 			var expected: int = [3, 5, 7, 9, 12][number - 1] + (players - 1) * number

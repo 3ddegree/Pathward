@@ -1,11 +1,11 @@
 extends RefCounted
 
 const CONFIG := [
-	{"number": 1, "rounds": 4, "base": 3, "per_extra_player": 1, "weights": [85, 10, 5], "boss": false},
-	{"number": 2, "rounds": 4, "base": 5, "per_extra_player": 2, "weights": [65, 25, 10], "boss": false},
-	{"number": 3, "rounds": 4, "base": 7, "per_extra_player": 3, "weights": [50, 30, 20], "boss": false},
-	{"number": 4, "rounds": 4, "base": 9, "per_extra_player": 4, "weights": [35, 35, 30], "boss": false},
-	{"number": 5, "rounds": 4, "base": 12, "per_extra_player": 5, "weights": [20, 35, 45], "boss": true},
+	{"number": 1, "event_bonus": 0, "type_faces": ["Grunt", "Grunt", "Grunt", "Grunt", "Grunt", "Runner"], "quantity_faces": [1, 1, 2, 2, 3, 3], "rounds": 4, "base": 3, "per_extra_player": 1, "weights": [85, 10, 5], "boss": false},
+	{"number": 2, "event_bonus": 0, "type_faces": ["Grunt", "Grunt", "Grunt", "Grunt", "Runner", "Runner"], "quantity_faces": [1, 2, 2, 3, 3, 4], "rounds": 4, "base": 5, "per_extra_player": 2, "weights": [65, 25, 10], "boss": false},
+	{"number": 3, "event_bonus": 1, "type_faces": ["Grunt", "Grunt", "Grunt", "Runner", "Runner", "Brute"], "quantity_faces": [1, 2, 3, 3, 4, 5], "rounds": 4, "base": 7, "per_extra_player": 3, "weights": [50, 30, 20], "boss": false},
+	{"number": 4, "event_bonus": 1, "type_faces": ["Grunt", "Grunt", "Runner", "Runner", "Brute", "Brute"], "quantity_faces": [2, 3, 3, 4, 4, 5], "rounds": 4, "base": 9, "per_extra_player": 4, "weights": [35, 35, 30], "boss": false},
+	{"number": 5, "event_bonus": 2, "type_faces": ["Grunt", "Runner", "Runner", "Brute", "Brute", "Brute"], "quantity_faces": [2, 3, 4, 4, 5, 6], "rounds": 4, "base": 12, "per_extra_player": 5, "weights": [20, 35, 45], "boss": true},
 ]
 const ORDINARY_TYPES := ["Grunt", "Runner", "Brute"]
 const BOSS_TYPE := "Boss"
@@ -14,6 +14,10 @@ class Spawn:
 	var wave: int
 	var due_turn: int
 	var kind: String
+	var event_number := 0
+	var lane := -1
+	var rolled_kind := ""
+	var quantity := 0
 
 var rng := RandomNumberGenerator.new()
 var pending: Array[Spawn] = []
@@ -22,6 +26,7 @@ var current_wave := 1
 var wave_round := 1
 var completed_turns := 0
 var round_override := 0
+var legacy_mode := false
 
 
 func reset(players: int, seed_value: int, start_wave: int = 1) -> void:
@@ -39,7 +44,8 @@ func reset(players: int, seed_value: int, start_wave: int = 1) -> void:
 		first_turns[number] = first_turn
 		var data: Dictionary = CONFIG[number - 1]
 		var rounds := duration(number)
-		var count := ordinary_count(number, players)
+		var count := ordinary_count(number, players) if legacy_mode else event_count(number, players)
+		var event_number := 0
 		@warning_ignore("integer_division")
 		var per_round := count / rounds
 		for offset in range(rounds):
@@ -47,7 +53,11 @@ func reset(players: int, seed_value: int, start_wave: int = 1) -> void:
 				queue_spawn(number, first_turn, BOSS_TYPE)
 			var batch := per_round + (1 if offset < count % rounds else 0)
 			for _index in range(batch):
-				queue_spawn(number, first_turn + offset, roll_kind(number))
+				if legacy_mode:
+					queue_spawn(number, first_turn + offset, roll_kind(number))
+				else:
+					event_number += 1
+					queue_spawn(number, first_turn + offset, "", event_number)
 		first_turn += rounds
 
 
@@ -58,6 +68,26 @@ func duration(number: int) -> int:
 func ordinary_count(number: int, players: int) -> int:
 	var data: Dictionary = CONFIG[number - 1]
 	return maxi(0, data.base + maxi(0, players - 1) * data.per_extra_player)
+
+
+func event_count(number: int, players: int) -> int:
+	return maxi(0, players + CONFIG[number - 1].event_bonus)
+
+
+func roll_die(number: int, die: int) -> Variant:
+	if die == 0:
+		return rng.randi_range(0, 3)
+	if die == 1:
+		return CONFIG[number - 1].type_faces[rng.randi_range(0, 5)]
+	return CONFIG[number - 1].quantity_faces[rng.randi_range(0, 5)]
+
+
+func remaining_events(number: int) -> int:
+	var count := 0
+	for entry in pending:
+		if entry.wave == number and entry.event_number > 0:
+			count += 1
+	return count
 
 
 func roll_kind(number: int) -> String:
@@ -75,11 +105,12 @@ func roll_kind(number: int) -> String:
 	return ORDINARY_TYPES[0]
 
 
-func queue_spawn(number: int, turn: int, kind: String) -> void:
+func queue_spawn(number: int, turn: int, kind: String, event_number: int = 0) -> void:
 	var entry := Spawn.new()
 	entry.wave = number
 	entry.due_turn = turn
 	entry.kind = kind
+	entry.event_number = event_number
 	pending.append(entry)
 
 

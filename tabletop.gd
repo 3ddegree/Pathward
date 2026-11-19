@@ -1,5 +1,7 @@
 extends Node3D
 
+const DicePanel := preload("res://spawn_dice_panel.gd")
+const PartyPanel := preload("res://party_panel.gd")
 const WaveSchedule := preload("res://wave_schedule.gd")
 const ExplorationDeck := preload("res://exploration_deck.gd")
 const RoadNetwork := preload("res://road_network.gd")
@@ -19,7 +21,7 @@ const ENEMY_TYPES := {
 	"Brute": {"stride": 1, "breach_damage": 2, "attack_damage": 2, "health": 2, "color": Color("#f46ea5")},
 	"Boss": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 3, "color": Color("#be8cff"), "remove_on_breach": false},
 }
-enum Phase { TITLE, SETUP, PLAYER, ENEMY, ROUND_START, COMPLETE }
+enum Phase { TITLE, SETUP, PLAYER, ENEMY, SPAWN_DICE, ROUND_START, COMPLETE }
 enum FrontlineOrder { FIRST_PLAYER, LAST_PLAYER }
 
 @export var frontline_order: FrontlineOrder = FrontlineOrder.FIRST_PLAYER
@@ -107,6 +109,18 @@ var final_boss: Enemy
 var boss_spawned := false
 var boss_defeated := false
 var wave_status: Label
+var spawn_dice: DicePanel
+var party_panel: PartyPanel
+var active_hero_heading: Label
+var dice_reference_button: Button
+var spawn_history_button: Button
+var debug_fixed_counts: CheckButton
+var debug_die_picker: OptionButton
+var debug_dice := WaveSchedule.new()
+var active_spawn: WaveSchedule.Spawn
+var enemy_report: Array[String] = []
+var spawn_history: Array[String] = []
+var last_spawn_result := ""
 var wave_debug_enabled := OS.is_debug_build() and "--pathward-wave-debug" in OS.get_cmdline_user_args()
 var wave_debug_setup: HBoxContainer
 var wave_debug_live: HBoxContainer
@@ -401,6 +415,9 @@ func build_controls() -> void:
 	dice_status = centered_label(rows)
 	wave_status = centered_label(rows)
 	status = centered_label(rows)
+	active_hero_heading = centered_label(rows)
+	active_hero_heading.add_theme_font_size_override("font_size", 24)
+	build_spawn_controls(rows, overlay)
 	instructions = centered_label(rows)
 
 	build_setup_controls(rows)
@@ -537,6 +554,8 @@ func advance_phase() -> void:
 			waves.round_override = wave_round_override
 			var start := debug_wave_picker.selected + 1 if wave_debug_enabled else 1
 			var seed_value := int(debug_wave_seed.value) if wave_debug_enabled else wave_seed
+			if wave_debug_enabled:
+				waves.legacy_mode = debug_fixed_counts.button_pressed
 			waves.reset(heroes.size(), seed_value, start)
 			begin_player_turn(0, wave_announcement())
 		Phase.PLAYER:
@@ -927,21 +946,117 @@ func move_hero(destination: int) -> void:
 		refresh("%s moved %d %s." % [hero.title, cost, "space" if cost == 1 else "spaces"])
 
 
-func spawn_due_enemies(report: Array[String]) -> void:
-	var rolls: Array[String] = []
+func build_spawn_controls(rows: VBoxContainer, overlay: CanvasLayer) -> void:
+	spawn_dice = DicePanel.new()
+	rows.add_child(spawn_dice)
+	spawn_dice.rolled.connect(roll_spawn_die)
+	var tools_row := HBoxContainer.new()
+	tools_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	rows.add_child(tools_row)
+	dice_reference_button = action(tools_row, "Dice faces", show_spawn_faces)
+	spawn_history_button = action(tools_row, "Spawn history", show_spawn_history)
+	party_panel = PartyPanel.new()
+	party_panel.position = Vector2(16, 76)
+	overlay.add_child(party_panel)
+
+
+func valid_spawn_lanes() -> Array[int]:
+	var lanes: Array[int] = []
+	for lane in range(LANE_NAMES.size()):
+		if network.entry_for_lane(lane) > FORTRESS:
+			lanes.append(lane)
+	return lanes
+
+
+func next_spawn_die() -> int:
+	if active_spawn == null:
+		return -1
+	if active_spawn.lane < 0:
+		return 0
+	if active_spawn.rolled_kind.is_empty():
+		return 1
+	return 2 if active_spawn.quantity == 0 else -1
+
+
+func roll_spawn_die(die: int) -> void:
+	if phase != Phase.SPAWN_DICE or die != next_spawn_die() or die < 0:
+		return
+	var result: Variant = waves.roll_die(active_spawn.wave, die)
+	match die:
+		0:
+			active_spawn.lane = result
+		1:
+			active_spawn.rolled_kind = result
+		2:
+			active_spawn.quantity = result
+			spawn_due_enemies()
+			return
+	refresh("")
+
+
+func spawn_due_enemies() -> void:
 	var deferred := 0
+	var direct_rolls: Array[String] = []
+	active_spawn = null
+	var lanes := valid_spawn_lanes()
 	for entry in waves.due_spawns():
-		var lane := spawn_enemy(entry.kind)
-		if lane < 0:
+		if lanes.is_empty():
 			deferred += 1
 			continue
-		rolls.append("%s → %s" % [entry.kind, LANE_NAMES[lane]])
+		if entry.event_number > 0:
+			if entry.quantity == 0:
+				active_spawn = entry
+				if not direct_rolls.is_empty():
+					dice_result = "Separate spawns   " + "  ·  ".join(direct_rolls)
+				phase = Phase.SPAWN_DICE
+				refresh(" ".join(enemy_report))
+				return
+			var actual := entry.lane if entry.lane in lanes else lanes[waves.rng.randi_range(0, lanes.size() - 1)]
+			for _monster in range(entry.quantity):
+				spawn_enemy(entry.rolled_kind, actual)
+			var fallback := " · %s unavailable, used %s" % [LANE_NAMES[entry.lane], LANE_NAMES[actual]] if actual != entry.lane else ""
+			last_spawn_result = "Wave %d · Round %d · Event %d: Lane %s · %s · Quantity %d · Spawned %d on %s%s" % [
+				entry.wave, round_number, entry.event_number, LANE_NAMES[entry.lane], entry.rolled_kind,
+				entry.quantity, entry.quantity, LANE_NAMES[actual], fallback,
+			]
+			spawn_history.append(last_spawn_result)
+		else:
+			var lane := spawn_enemy(entry.kind)
+			if lane < 0:
+				deferred += 1
+				continue
+			direct_rolls.append("%s → %s" % [entry.kind, LANE_NAMES[lane]])
+			if entry.kind == WaveSchedule.BOSS_TYPE:
+				enemy_report.append("The boss entered %s." % LANE_NAMES[lane])
 		waves.pending.erase(entry)
-	dice_result = "Lane d4   " + "  ·  ".join(rolls) if not rolls.is_empty() else ""
-	if not rolls.is_empty():
-		report.append("%d monsters spawned." % rolls.size())
+	if not direct_rolls.is_empty():
+		dice_result = "Separate spawns   " + "  ·  ".join(direct_rolls)
 	if deferred > 0:
-		report.append("%d spawns deferred. No valid lane." % deferred)
+		enemy_report.append("%d spawns deferred. No valid lane." % deferred)
+	finish_enemy_turn()
+
+
+func show_spawn_faces() -> void:
+	var number := active_spawn.wave if active_spawn != null else waves.current_wave
+	show_wave_debug(dice_faces_text(number), "Spawn dice")
+
+
+func dice_faces_text(number: int) -> String:
+	var data: Dictionary = WaveSchedule.CONFIG[number - 1]
+	var quantities: Array[String] = []
+	for value: int in data.quantity_faces:
+		quantities.append(str(value))
+	var types: Array[String] = []
+	for kind: String in WaveSchedule.ORDINARY_TYPES:
+		types.append("%s %d/6" % [kind, data.type_faces.count(kind)])
+	return "Wave %d\nLane D4: %s\nMonster D6: %s\nDistribution: %s\nQuantity D6: %s" % [
+		number, " | ".join(LANE_NAMES), " | ".join(data.type_faces), ", ".join(types), " | ".join(quantities),
+	]
+
+
+func show_spawn_history() -> void:
+	var recent := spawn_history.slice(maxi(0, spawn_history.size() - 8))
+	show_wave_debug("\n\n".join(recent) if not recent.is_empty() else "No spawn events rolled yet.", "Recent spawn events")
 
 
 func wave_announcement() -> String:
@@ -950,16 +1065,15 @@ func wave_announcement() -> String:
 	return "Wave %d begins." % waves.current_wave
 
 
-func spawn_enemy(title: String) -> int:
+func spawn_enemy(title: String, requested_lane: int = -1) -> int:
 	if title == WaveSchedule.BOSS_TYPE and (waves.current_wave != WaveSchedule.CONFIG.size() or boss_spawned):
 		return -1
-	var valid_lanes: Array[int] = []
-	for lane in range(LANE_NAMES.size()):
-		if network.entry_for_lane(lane) > FORTRESS:
-			valid_lanes.append(lane)
-	if valid_lanes.is_empty():
-		return -1
-	var lane := valid_lanes[waves.rng.randi_range(0, valid_lanes.size() - 1)]
+	var lane := requested_lane
+	if requested_lane < 0 or requested_lane >= LANE_NAMES.size() or network.entry_for_lane(requested_lane) <= FORTRESS:
+		var lanes := valid_spawn_lanes()
+		if lanes.is_empty():
+			return -1
+		lane = lanes[waves.rng.randi_range(0, lanes.size() - 1)]
 	var entry: Dictionary = ENEMY_TYPES[title]
 	var enemy := Enemy.new()
 	enemy.title = title
@@ -1041,6 +1155,7 @@ func resolve_enemies() -> void:
 	var damage := 0
 	var report: Array[String] = []
 	fork_rolls.clear()
+	dice_result = ""
 	var warden: Hero
 	for hero in heroes:
 		hero.damage_this_turn = 0
@@ -1107,21 +1222,27 @@ func resolve_enemies() -> void:
 
 	if damage > 0:
 		report.append("Fortress lost %d HP." % damage)
+	enemy_report.assign(report)
 	if integrity == 0:
-		waves.complete_turn()
-		phase = Phase.COMPLETE
-		report.append("The base was destroyed.")
+		finish_enemy_turn()
 	else:
-		spawn_due_enemies(report)
-		if waves.complete_turn():
+		spawn_due_enemies()
+
+
+func finish_enemy_turn() -> void:
+	active_spawn = null
+	var advanced := waves.complete_turn()
+	if integrity == 0:
+		phase = Phase.COMPLETE
+		enemy_report.append("The base was destroyed.")
+	else:
+		if advanced:
 			warden_defended = false
-			report.append(wave_announcement())
+			enemy_report.append(wave_announcement())
 		if waves.pending.is_empty() and enemies.is_empty() and boss_defeated:
 			phase = Phase.COMPLETE
-			report.append("The fortress held through all %d waves." % WaveSchedule.CONFIG.size())
-	if report.is_empty():
-		report.append("Enemies advanced.")
-	var message := " ".join(report)
+			enemy_report.append("The fortress held through all %d waves." % WaveSchedule.CONFIG.size())
+	var message := " ".join(enemy_report) if not enemy_report.is_empty() else "Enemy Turn complete."
 	if phase == Phase.COMPLETE:
 		refresh(message)
 	else:
@@ -1525,7 +1646,19 @@ func build_wave_debug(rows: VBoxContainer) -> void:
 	debug_wave_seed.value = wave_seed
 	debug_wave_seed.prefix = "Seed "
 	wave_debug_setup.add_child(debug_wave_seed)
+	debug_fixed_counts = CheckButton.new()
+	debug_fixed_counts.text = "Legacy counts"
+	debug_fixed_counts.set_pressed_no_signal(waves.legacy_mode)
+	wave_debug_setup.add_child(debug_fixed_counts)
 	action(wave_debug_setup, "Wave config", debug_view_wave_config)
+	debug_die_picker = OptionButton.new()
+	for label: String in DicePanel.LABELS:
+		debug_die_picker.add_item(label)
+	wave_debug_setup.add_child(debug_die_picker)
+	debug_wave_seed.value_changed.connect(reset_debug_dice)
+	reset_debug_dice(debug_wave_seed.value)
+	action(wave_debug_setup, "Test die", debug_test_dice)
+	action(wave_debug_setup, "Simulate 100", debug_simulate_dice)
 
 	wave_debug_live = HBoxContainer.new()
 	wave_debug_live.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -1549,11 +1682,49 @@ func debug_view_wave_config() -> void:
 	var lines: Array[String] = []
 	for data: Dictionary in WaveSchedule.CONFIG:
 		var rounds := wave_round_override if wave_round_override > 0 else int(data.rounds)
-		lines.append("Wave %d · %d rounds · %d ordinary · Weights %s%s" % [
-			data.number, rounds, waves.ordinary_count(data.number, player_count.selected + 1),
-			str(data.weights), " · Boss +1" if data.boss else "",
+		var players := player_count.selected + 1
+		var count := waves.ordinary_count(data.number, players) if debug_fixed_counts.button_pressed else waves.event_count(data.number, players)
+		lines.append("Wave %d · %d rounds · %d %s%s" % [
+			data.number, rounds, count, "fixed monsters" if debug_fixed_counts.button_pressed else "dice events",
+			" · Boss +1" if data.boss else "",
 		])
-	show_wave_debug("Grunt / Runner / Brute weights\n\n" + "\n".join(lines))
+	show_wave_debug("\n".join(lines) + "\n\n" + dice_faces_text(debug_wave_picker.selected + 1))
+
+
+func reset_debug_dice(value: float) -> void:
+	if int(value) == 0:
+		debug_dice.rng.randomize()
+	else:
+		debug_dice.rng.seed = int(value)
+
+
+func debug_test_dice() -> void:
+	if not wave_debug_enabled or phase != Phase.SETUP:
+		return
+	var number := debug_wave_picker.selected + 1
+	var die := debug_die_picker.selected
+	var result: Variant = debug_dice.roll_die(number, die)
+	var value := str(LANE_NAMES[result]) if die == 0 else str(result)
+	show_wave_debug("%s rolled %s\n\n%s" % [DicePanel.LABELS[die], value, dice_faces_text(number)])
+
+
+func debug_simulate_dice() -> void:
+	if not wave_debug_enabled or phase != Phase.SETUP:
+		return
+	var number := debug_wave_picker.selected + 1
+	var simulator := WaveSchedule.new()
+	var seed_value := int(debug_wave_seed.value)
+	simulator.reset(1, seed_value, number)
+	var total := 0
+	var counts := {}
+	for _roll in range(100):
+		simulator.roll_die(number, 0)
+		var kind: String = simulator.roll_die(number, 1)
+		counts[kind] = int(counts.get(kind, 0)) + 1
+		total += int(simulator.roll_die(number, 2))
+	show_wave_debug("%s\n\n100 simulated events · Average quantity %.2f · %s" % [
+		dice_faces_text(number), total / 100.0, str(counts),
+	])
 
 
 func debug_view_schedule() -> void:
@@ -1564,7 +1735,7 @@ func debug_view_schedule() -> void:
 		var key := "Wave %d, Enemy Turn %d" % [entry.wave, entry.due_turn]
 		if not batches.has(key):
 			batches[key] = []
-		batches[key].append(entry.kind)
+		batches[key].append("Dice #%d" % entry.event_number if entry.event_number > 0 else entry.kind)
 	var lines: Array[String] = []
 	for key: String in batches:
 		lines.append("%s · %s" % [key, ", ".join(batches[key])])
@@ -1601,15 +1772,15 @@ func debug_spawn_enemy() -> void:
 	refresh("%s spawned on lane %s for testing." % [title, LANE_NAMES[lane]])
 
 
-func show_wave_debug(message: String) -> void:
-	card_notice.title = "Wave debug"
+func show_wave_debug(message: String, heading: String = "Wave debug") -> void:
+	card_notice.title = heading
 	card_notice.dialog_text = message
 	if DisplayServer.get_name() != "headless":
 		card_notice.popup_centered(Vector2i(640, 0))
 
 
 func refresh(message: String) -> void:
-	var health_readout: Array[String] = ["Fortress %d/%d HP" % [integrity, MAX_INTEGRITY]]
+	var party_readout: Array[String] = []
 	for index in range(heroes.size()):
 		var hero := heroes[index]
 		hero.piece.position = network.positions[hero.location]
@@ -1627,8 +1798,12 @@ func refresh(message: String) -> void:
 		hero.health_label.modulate = Color("#ff826d") if incapacitated else Color.WHITE
 		if incapacitated:
 			hero.health_label.text += " · Down"
-		health_readout.append("%s %d/%d HP%s" % [hero.title, hero.health, hero.max_health, " (Incapacitated)" if incapacitated else ""])
-	health_status.text = "    ·    ".join(health_readout)
+		party_readout.append("P%d · %s%s\nHP %d/%d   Move %d   Actions %d   Energy %d/%d" % [
+			index + 1, hero.title, " · Down" if incapacitated else "", hero.health, hero.max_health,
+			hero.budget.movement_left, hero.budget.actions_left, hero.budget.energy, hero.budget.max_energy,
+		])
+	party_panel.show_party(party_readout, active_player if phase == Phase.PLAYER else -1)
+	health_status.text = "Fortress %d/%d HP" % [integrity, MAX_INTEGRITY]
 	legal_moves = find_moves()
 	attack_targets = find_attack_targets()
 	var options := reveal_options()
@@ -1647,11 +1822,22 @@ func refresh(message: String) -> void:
 		rolls.append("Fork rolls   " + "  ·  ".join(fork_rolls))
 	if not dice_result.is_empty():
 		rolls.append(dice_result)
+	if not last_spawn_result.is_empty():
+		rolls.append(last_spawn_result)
 	dice_status.text = "\n".join(rolls)
 
 	var in_game := phase != Phase.TITLE and phase != Phase.SETUP
 	setup_controls.visible = phase == Phase.SETUP
 	health_status.visible = in_game
+	party_panel.visible = in_game
+	active_hero_heading.visible = phase == Phase.PLAYER
+	dice_reference_button.visible = in_game and not waves.legacy_mode
+	spawn_history_button.visible = in_game and not waves.legacy_mode
+	spawn_history_button.disabled = spawn_history.is_empty()
+	spawn_dice.visible = phase == Phase.SPAWN_DICE
+	if spawn_dice.visible:
+		var lane: String = LANE_NAMES[active_spawn.lane] if active_spawn.lane >= 0 else ""
+		spawn_dice.show_rolls(lane, active_spawn.rolled_kind, active_spawn.quantity, next_spawn_die())
 	turn_status.visible = phase == Phase.PLAYER
 	fortress_health.visible = in_game
 	fortress_health.text = "■".repeat(integrity) + "□".repeat(MAX_INTEGRITY - integrity)
@@ -1662,9 +1848,13 @@ func refresh(message: String) -> void:
 		var countdown := "Next wave in %d rounds" % waves.rounds_until_next_wave()
 		if waves.current_wave == WaveSchedule.CONFIG.size():
 			countdown = "Final wave"
-		wave_status.text = "Wave %d/%d · Wave round %d · %s · Active %d · Scheduled this wave %d · Enemy Turns %d" % [
+		var remaining := waves.remaining_spawns(waves.current_wave) if waves.legacy_mode else waves.remaining_events(waves.current_wave)
+		var due := waves.due_spawns().size()
+		if not waves.legacy_mode:
+			due = waves.due_spawns().filter(func(entry: WaveSchedule.Spawn) -> bool: return entry.event_number > 0).size()
+		wave_status.text = "Wave %d/%d · Wave round %d · %s · Active %d · %s left: %d wave / %d round · Enemy Turns %d" % [
 			waves.current_wave, WaveSchedule.CONFIG.size(), waves.wave_round, countdown, enemies.size(),
-			waves.remaining_spawns(waves.current_wave), waves.completed_turns,
+			"Spawns" if waves.legacy_mode else "Dice events", remaining, due, waves.completed_turns,
 		]
 	if wave_debug_enabled:
 		wave_debug_setup.visible = phase == Phase.SETUP
@@ -1682,7 +1872,7 @@ func refresh(message: String) -> void:
 	tile_diagram.queue_redraw()
 	rotate_button.disabled = drawn_tile < 0 or fitting_rotations(placement_target, drawn_tile).size() < 2
 	place_button.disabled = not tile_fits()
-	phase_button.visible = phase != Phase.COMPLETE
+	phase_button.visible = phase != Phase.COMPLETE and phase != Phase.SPAWN_DICE
 	phase_button.disabled = pending_owner != null
 	attack_button.visible = phase == Phase.PLAYER
 	attack_button.disabled = pending_owner != null or selected_card >= 0 or tile_card.visible or attack_targets.is_empty()
@@ -1701,11 +1891,14 @@ func refresh(message: String) -> void:
 		Phase.PLAYER:
 			var player := heroes[active_player]
 			var budget := player.budget
-			turn_status.text = "Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Reveals %d/%d   ·   Attack %d damage, range %d" % [
-				budget.movement_left, budget.movement_limit, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
+			active_hero_heading.text = "Player %d — %s" % [active_player + 1, player.title]
+			var definition: Dictionary = HeroCatalog.DEFINITIONS[character_pickers[active_player].selected]
+			turn_status.text = "HP %d/%d   ·   Movement %d/%d   ·   Actions %d/%d   ·   Energy %d/%d   ·   Reveals %d/%d   ·   Attack %d damage, range %d" % [
+				player.health, player.max_health, budget.movement_left, budget.movement_limit, budget.actions_left, HeroTurn.ACTIONS_PER_TURN,
 				budget.energy, budget.max_energy, budget.reveals_left, budget.reveal_limit,
 				player.attack_damage, player.attack_range,
 			]
+			turn_status.text += "\n%s · %d Energy (%s)" % [definition.ability_name, definition.ability_energy, "proposed; passive active" if definition.ability_passive else "planned"]
 			phase_button.text = "End Player %d’s turn" % (active_player + 1)
 			if pending_owner != null:
 				instructions.text = "Choose a card to discard before continuing."
@@ -1738,7 +1931,10 @@ func refresh(message: String) -> void:
 				instructions.text = "%s   ·   %s   ·   %s" % [move_status, attack_status, reveal_status]
 		Phase.ENEMY:
 			phase_button.text = "Enemy Turn"
-			instructions.text = "Existing monsters act first. Scheduled monsters enter afterward."
+			instructions.text = "Existing monsters act first. Roll any scheduled spawns afterward."
+		Phase.SPAWN_DICE:
+			var prompts := ["Roll the lane D4.", "Roll the monster-type D6.", "Roll the quantity D6."]
+			instructions.text = "Wave %d · Event %d. %s" % [active_spawn.wave, active_spawn.event_number, prompts[next_spawn_die()]]
 		Phase.ROUND_START:
 			phase_button.text = "Continue round"
 			instructions.text = "All heroes are incapacitated. Continue to the next Enemy Turn."
@@ -1752,6 +1948,8 @@ func refresh(message: String) -> void:
 				phase_title = "Player %d’s turn · %s" % [active_player + 1, heroes[active_player].title]
 			Phase.ENEMY:
 				phase_title = "Enemy phase"
+			Phase.SPAWN_DICE:
+				phase_title = "Enemy Turn · Roll spawning dice"
 			Phase.ROUND_START:
 				phase_title = "All heroes down"
 			Phase.COMPLETE:
