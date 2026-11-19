@@ -12,10 +12,10 @@ const HeroCatalog := preload("res://hero_catalog.gd")
 const HeroTurn := preload("res://hero_turn.gd")
 const MAX_PLAYERS := 5
 const ENEMY_TYPES := {
-	"Grunt": {"stride": 1, "damage": 1, "health": 1, "color": Color("#ff865e")},
-	"Runner": {"stride": 2, "damage": 1, "health": 1, "color": Color("#f4ce63")},
-	"Brute": {"stride": 1, "damage": 2, "health": 2, "color": Color("#f46ea5")},
-	"Boss": {"stride": 1, "damage": 2, "health": 3, "color": Color("#be8cff")},
+	"Grunt": {"stride": 1, "breach_damage": 1, "attack_damage": 1, "health": 1, "color": Color("#ff865e")},
+	"Runner": {"stride": 2, "breach_damage": 1, "attack_damage": 1, "health": 1, "color": Color("#f4ce63")},
+	"Brute": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 2, "color": Color("#f46ea5")},
+	"Boss": {"stride": 1, "breach_damage": 2, "attack_damage": 1, "health": 3, "color": Color("#be8cff"), "remove_on_breach": true},
 }
 const WAVE_PLANS := [
 	[
@@ -44,6 +44,10 @@ class Hero:
 	var attack_range: int
 	var piece: Node3D
 	var health_label: Label3D
+	var figure: Node3D
+	var damage_indicator: Label3D
+	var damage_feedback: Tween
+	var damage_this_turn := 0
 	var base: MeshInstance3D
 
 class Enemy:
@@ -51,7 +55,11 @@ class Enemy:
 	var visited: Dictionary = {}
 	var title: String
 	var stride: int
-	var damage: int
+	var breach_damage: int
+	var attack_damage: int
+	var remove_on_breach: bool
+	var blocked_destination := -1
+	var attack_animation: Tween
 	var health: int
 	var max_health: int
 	var health_label: Label3D
@@ -242,7 +250,10 @@ func build_heroes() -> void:
 		hero.max_health = entry["health"]
 		hero.health = hero.max_health
 		hero.location = FORTRESS
-		hero.piece = miniature(hero.title, entry["color"])
+		hero.piece = Node3D.new()
+		add_child(hero.piece)
+		hero.figure = miniature(hero.title, entry["color"])
+		hero.figure.reparent(hero.piece, false)
 		hero.base = block(Vector3(0, 0.02, 0), Vector3(0.38, 0.04, 0.38), entry["color"], hero.piece)
 		hero.health_label = Label3D.new()
 		hero.health_label.position = Vector3.UP * 0.91
@@ -251,6 +262,14 @@ func build_heroes() -> void:
 		hero.health_label.font_size = 44
 		hero.health_label.outline_size = 12
 		hero.piece.add_child(hero.health_label)
+		hero.damage_indicator = Label3D.new()
+		hero.damage_indicator.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		hero.damage_indicator.font_size = 52
+		hero.damage_indicator.pixel_size = 0.005
+		hero.damage_indicator.outline_size = 12
+		hero.damage_indicator.modulate = Color("#ff826d")
+		hero.damage_indicator.hide()
+		hero.piece.add_child(hero.damage_indicator)
 		heroes.append(hero)
 
 
@@ -824,11 +843,29 @@ func click_attack_target(click: Vector2) -> void:
 
 
 func monster_attack(hero: Hero, enemy: Enemy) -> String:
-	var lost_hp := mini(hero.health, enemy.damage)
+	var lost_hp := mini(hero.health, enemy.attack_damage)
 	hero.health -= lost_hp
+	hero.damage_this_turn += lost_hp
+	if hero.damage_feedback != null and hero.damage_feedback.is_valid():
+		hero.damage_feedback.kill()
+	hero.damage_indicator.text = "−%d HP" % hero.damage_this_turn
+	hero.damage_indicator.position = Vector3.UP * 1.25
+	hero.damage_indicator.show()
+	hero.damage_feedback = hero.damage_indicator.create_tween()
+	hero.damage_feedback.tween_property(hero.damage_indicator, "position:y", 1.70, 0.8)
+	hero.damage_feedback.tween_callback(hero.damage_indicator.hide)
+
+	if enemy.attack_animation != null and enemy.attack_animation.is_valid():
+		enemy.attack_animation.kill()
+	enemy.piece.rotation.x = 0.0
+	enemy.attack_animation = enemy.piece.create_tween()
+	enemy.attack_animation.tween_property(enemy.piece, "rotation:x", 0.27, 0.08)
+	enemy.attack_animation.tween_property(enemy.piece, "rotation:x", 0.0, 0.15)
+
+	var message := "A %s attacked %s for %d HP." % [enemy.title, hero.title, lost_hp]
 	if hero.health == 0:
-		return "A %s defeated %s." % [enemy.title, hero.title]
-	return "A %s attacked %s for %d HP." % [enemy.title, hero.title, lost_hp]
+		message += " %s is incapacitated." % hero.title
+	return message
 
 
 func move_hero(destination: int) -> void:
@@ -855,7 +892,9 @@ func roll_wave() -> void:
 		var enemy := Enemy.new()
 		enemy.title = title
 		enemy.stride = entry["stride"]
-		enemy.damage = entry["damage"]
+		enemy.breach_damage = entry["breach_damage"]
+		enemy.attack_damage = entry.get("attack_damage", 1)
+		enemy.remove_on_breach = entry.get("remove_on_breach", true)
 		enemy.max_health = entry["health"]
 		enemy.health = enemy.max_health
 		enemy.location = network.entry_for_lane(lane)
@@ -919,14 +958,16 @@ func trigger_entry_trap(enemy: Enemy, from: int) -> String:
 
 
 func resolve_enemies() -> void:
+	if phase != Phase.ENEMY or wave_waiting:
+		return
 	var damage := 0
 	var report: Array[String] = []
 	fork_rolls.clear()
 	var warden: Hero
 	for hero in heroes:
+		hero.damage_this_turn = 0
 		if hero.id == &"warden":
 			warden = hero
-			break
 	var marching: Array[Enemy] = enemies.duplicate()
 	for enemy in marching:
 		if enemy not in enemies:
@@ -939,27 +980,36 @@ func resolve_enemies() -> void:
 			var routes := network.routes_from(enemy.location, enemy.visited)
 			if routes.is_empty():
 				break
-			var choice := 0
-			if routes.size() > 1:
-				var current_tile := network.tile_at(enemy.location)
-				if routes.size() == 2 and current_tile != null and current_tile.terrain.effect == &"fork":
-					choice = 0 if randf() < float(current_tile.terrain.parameters.first_branch_probability) else 1
-				else:
-					choice = randi_range(0, routes.size() - 1)
-				fork_rolls.append("%s d%d → %d" % [enemy.title, routes.size(), choice + 1])
+			var choice := routes.find(enemy.blocked_destination)
+			if choice < 0:
+				choice = 0
+				if routes.size() > 1:
+					var current_tile := network.tile_at(enemy.location)
+					if routes.size() == 2 and current_tile != null and current_tile.terrain.effect == &"fork":
+						choice = 0 if randf() < float(current_tile.terrain.parameters.first_branch_probability) else 1
+					else:
+						choice = randi_range(0, routes.size() - 1)
+					fork_rolls.append("%s d%d → %d" % [enemy.title, routes.size(), choice + 1])
 			var destination := routes[choice]
 			if destination == FORTRESS:
 				if warden != null and warden.health > 0 and warden.location == FORTRESS and not warden_defended:
 					warden_defended = true
 					report.append("Warden blocked a breach.")
 				else:
-					var lost_hp := mini(integrity, enemy.damage)
+					var lost_hp := mini(integrity, enemy.breach_damage)
 					integrity -= lost_hp
 					damage += lost_hp
-				remove_enemy(enemy)
+				if enemy.remove_on_breach:
+					remove_enemy(enemy)
 				break
 			var heading := network.positions[destination] - network.positions[enemy.location]
 			enemy.piece.rotation.y = atan2(heading.x, heading.z)
+			defender = hero_at(destination)
+			if defender != null:
+				enemy.blocked_destination = destination
+				report.append(monster_attack(defender, enemy))
+				break
+			enemy.blocked_destination = -1
 			var previous := enemy.location
 			enemy.location = destination
 			enemy.visited[destination] = true
@@ -967,9 +1017,6 @@ func resolve_enemies() -> void:
 			if not trap_message.is_empty():
 				report.append(trap_message)
 			if enemy not in enemies:
-				break
-			if hero_at(destination) != null:
-				report.append("A %s moved into a hero’s space." % enemy.title)
 				break
 
 		if integrity == 0:
@@ -1008,10 +1055,15 @@ func refresh(message: String) -> void:
 			else:
 				var angle := TAU * index / heroes.size()
 				hero.piece.position += Vector3(sin(angle), 0, cos(angle)) * 0.58
-		hero.piece.visible = hero.health > 0
+		var incapacitated := hero.health == 0
+		hero.figure.rotation.z = PI * 0.5 if incapacitated else 0.0
+		hero.figure.position.y = 0.20 if incapacitated else 0.0
 		hero.base.material_override = active_material if phase == Phase.PLAYER and index == active_player else idle_material
 		hero.health_label.text = "%d/%d" % [hero.health, hero.max_health]
-		health_readout.append("%s %d/%d HP" % [hero.title, hero.health, hero.max_health])
+		hero.health_label.modulate = Color("#ff826d") if incapacitated else Color.WHITE
+		if incapacitated:
+			hero.health_label.text += " · Down"
+		health_readout.append("%s %d/%d HP%s" % [hero.title, hero.health, hero.max_health, " (Incapacitated)" if incapacitated else ""])
 	health_status.text = "    ·    ".join(health_readout)
 	legal_moves = find_moves()
 	attack_targets = find_attack_targets()
@@ -1101,12 +1153,11 @@ func refresh(message: String) -> void:
 					reveal_status = "Reveal tile for 1 action"
 				instructions.text = "%s   ·   %s   ·   %s" % [move_status, attack_status, reveal_status]
 		Phase.ENEMY:
+			phase_button.text = "Enemy Turn"
 			if wave_waiting:
-				phase_button.text = "Roll wave · d4"
 				instructions.text = "Roll starting lanes for the incoming enemies."
 			else:
-				phase_button.text = "Advance enemies" if not enemies.is_empty() else "Finish wave"
-				instructions.text = "Resolve the enemy phase to continue."
+				instructions.text = "Resolve enemy movement, attacks, and breaches."
 		Phase.COMPLETE:
 			instructions.text = "Choose Restart to start a new game."
 

@@ -108,7 +108,7 @@ func run() -> void:
 	var tile = traps.network.tiles[Vector2i(2, 0)]
 	assert(tile.enemy_entries == 2 and tile.trap_spent and traps.enemies.is_empty())
 	assert(traps.trap_labels[Vector2i(2, 0)].text == "Trap spent")
-	assert(traps.integrity == 5 and traps.heroes[0].health == 5)
+	assert(traps.integrity == 5 and traps.heroes[0].health == traps.heroes[0].max_health)
 	traps.free()
 
 	var fork = make_board(1)
